@@ -49,6 +49,8 @@
     title: Streaming Video Encoding
   title: "Datasets"
 - sections:
+  - local: mgp
+    title: MGP
   - local: act
     title: ACT
   - local: smolvla
