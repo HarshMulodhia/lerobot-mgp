@@ -16,6 +16,7 @@ from lerobot.configs.parser import (
     extract_path_fields_from_config,
     get_path_arg,
     get_yaml_overrides,
+    normalize_legacy_cli_args,
 )
 
 
@@ -318,3 +319,17 @@ def test_wrap_uses_cleaned_config_for_draccus_parse():
 
     _config_path_args.clear()
     _config_yaml_overrides.clear()
+
+
+def test_normalize_legacy_cli_policy_type():
+    args = ["--policy_type=mgp", "--dataset.repo_id=foo/bar"]
+    normalized = normalize_legacy_cli_args(args)
+    assert "--policy.type=mgp" in normalized
+    assert "--policy_type=mgp" not in normalized
+    assert "--dataset.repo_id=foo/bar" in normalized
+
+
+def test_normalize_legacy_cli_reward_model_type():
+    args = ["--reward_model_type=topreward"]
+    normalized = normalize_legacy_cli_args(args)
+    assert normalized == ["--reward_model.type=topreward"]

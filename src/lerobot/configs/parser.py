@@ -43,6 +43,21 @@ _config_path_args: dict[str, str] = {}
 _config_yaml_overrides: dict[str, list[str]] = {}
 
 
+def normalize_legacy_cli_args(args: Sequence[str]) -> list[str]:
+    """Normalize legacy top-level policy/reward type args to nested draccus args."""
+    normalized = list(args)
+    replacements = {
+        "--policy_type=": "--policy.type=",
+        "--reward_model_type=": "--reward_model.type=",
+    }
+    for i, arg in enumerate(normalized):
+        for legacy, new_prefix in replacements.items():
+            if arg.startswith(legacy):
+                normalized[i] = f"{new_prefix}{arg.removeprefix(legacy)}"
+                break
+    return normalized
+
+
 def _flatten_to_cli_args(d: dict, prefix: str = "") -> list[str]:
     """Recursively flatten a nested dict to CLI-style args (e.g. {"lr": 1e-4} -> ["--lr=0.0001"])."""
     args = []
@@ -290,7 +305,7 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                 cfg = args[0]
                 args = args[1:]
             else:
-                cli_args = sys.argv[1:]
+                cli_args = normalize_legacy_cli_args(sys.argv[1:])
                 plugin_args = parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, cli_args)
                 for plugin_cli_arg, plugin_path in plugin_args.items():
                     try:

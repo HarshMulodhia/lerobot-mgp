@@ -15,7 +15,7 @@
 
 </div>
 
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
+**LeRobot-MGP** is an MGP-focused fork of **LeRobot** that keeps LeRobot's data collection, training, and deployment stack while prioritizing Markov Generator Policy workflows for real-world robotics.
 
 🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
 
@@ -93,16 +93,25 @@ LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation
   <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
 </p>
 
-Training a policy is as simple as running a script configuration:
+Training an MGP policy is as simple as running:
 
 ```bash
 lerobot-train \
-  --policy=act \
+  --policy.type=mgp \
+  --dataset.repo_id=lerobot/aloha_mobile_cabinet
+```
+
+Legacy shorthand is also supported:
+
+```bash
+lerobot-train \
+  --policy_type=mgp \
   --dataset.repo_id=lerobot/aloha_mobile_cabinet
 ```
 
 | Category                   | Models                                                                                                                                                                                                                  |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **MGP (primary)**          | [MGP](./docs/source/mgp.mdx)                                                                                                                                                                                            |
 | **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md) |
 | **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                             |
 | **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx)            |
@@ -167,6 +176,10 @@ If you are referencing our research or the academic paper, please also cite our 
 ## Contribute
 
 We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
+
+## Upstream Reference
+
+This project is built on top of [huggingface/lerobot](https://github.com/huggingface/lerobot). We keep compatibility with LeRobot's core abstractions and acknowledge the upstream maintainers and contributors.
 
 <p align="center">
   <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
