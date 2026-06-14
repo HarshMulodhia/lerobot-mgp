@@ -15,519 +15,435 @@
 # limitations under the License.
 
 """
-Generator Matching Theory Utilities for MGP
+Markov Generative Policy Utilities
 
-Core components implementing unified Markov generative policies:
-- Probability paths (Gaussian CondOT) - Section 3.1
-- Markov generators (flow, diffusion, jump, CTMC) - Section 3.3
-- Generator Matching losses (CGM) - Section 3.4, 4.3
-- Safety constraints for hardware - Section 6.1
-- Reward alignment methods - Section 6.1-6.5
-
-Theory: Generator Matching defines a Bregman-divergence loss between the
-infinitesimal evolution induced by L_t and target evolution consistent with p_t.
-Conditional Generator Matching (CGM) applies this at the level of conditional
-paths p_t(·|z), yielding scalable objectives that reduce to MSE/KL losses.
+Components:
+- Probability paths (Section 3.1): Gaussian CondOT
+- Generator Matching loss (Section 3.4, 4.3)
+- Generator implementations: Flow, Jump, CTMC
+- Safety constraints (Section 6.1)
+- Markov superposition utilities
 """
 
-import math
+import logging
+from typing import Any, Dict, Optional, Tuple
+
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import Optional, Tuple, Dict, Callable
-import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
-class GaussianCondOTPath(nn.Module):
-    """
-    Gaussian Conditional Optimal Transport (CondOT) Path (Section 3.1).
-
-    Theory: p_t(x|z) = N(α_t * z, σ_t² * I)
-    with α_0=0, α_1=1, σ_0=1, σ_1=0.
-
-    Implements the conditional probability path that interpolates between
-    a simple prior (p_0) and the data distribution (p_1) in action space
-    for SO-101 manipulation tasks.
-
-    References:
-    - Section 3.1: Probability paths in action space
-    - Section 4.1: Action space as state space for diffusion
+class GaussianCondOTPath:
+    """Gaussian Conditional Optimal Transport Path (Section 3.1).
+    
+    Probability path from data x_1 to noise N(0, I) with interpolation:
+    γ_t = (1-t) x_1 + t ε, where t ∈ [0, 1]
+    
+    Parametrized via noise schedule σ(t).
     """
 
-    def __init__(self, sigma_schedule: str = "linear"):
-        """
+    def __init__(self, sigma_schedule: str = "linear", num_timesteps: int = 1000):
+        """Initialize probability path with noise schedule.
+        
         Args:
             sigma_schedule: 'linear', 'cosine', or 'exponential'
+            num_timesteps: Total diffusion timesteps
         """
-        super().__init__()
         self.sigma_schedule = sigma_schedule
+        self.num_timesteps = num_timesteps
+        self._build_schedule()
+
+    def _build_schedule(self):
+        """Build noise schedule σ(t)."""
+        t = torch.linspace(0, 1, self.num_timesteps + 1)
+        
+        if self.sigma_schedule == "linear":
+            self.sigmas = 0.1 + 19.9 * t
+        elif self.sigma_schedule == "cosine":
+            self.sigmas = torch.cos(t * torch.pi / 2)
+        elif self.sigma_schedule == "exponential":
+            self.sigmas = torch.exp(t * torch.log(torch.tensor(20.0)))
+        else:
+            raise ValueError(f"Unknown sigma_schedule: {self.sigma_schedule}")
 
     def alpha_t(self, t: Tensor) -> Tensor:
-        """Signal strength interpolation: 0 at t=0, 1 at t=1."""
-        return t
+        """Get α(t) = 1/sqrt(1 + σ(t)²)."""
+        sigma_t = self.sigma_t(t)
+        return 1.0 / torch.sqrt(1.0 + sigma_t ** 2)
 
     def sigma_t(self, t: Tensor) -> Tensor:
-        """Noise scale: 1 at t=0, 0 at t=1."""
-        if self.sigma_schedule == "linear":
-            return 1.0 - t
-        elif self.sigma_schedule == "cosine":
-            return torch.cos(t * math.pi / 2)
-        elif self.sigma_schedule == "exponential":
-            return torch.exp(-(t * 5.0))
-        else:
-            raise ValueError(f"Unknown schedule: {self.sigma_schedule}")
+        """Get σ(t) from schedule."""
+        t_indices = (t * self.num_timesteps).long().clamp(0, self.num_timesteps)
+        return self.sigmas[t_indices]
 
-    def forward(self, x0: Tensor, t: Tensor) -> Tensor:
-        """Mean of conditional distribution: μ_t = α_t * x0."""
-        if isinstance(t, float):
-            t = torch.tensor(t, device=x0.device, dtype=x0.dtype)
-        if t.dim() == 0:
-            t = t.unsqueeze(0)
-
-        while t.dim() < x0.dim():
-            t = t.unsqueeze(-1)
-
-        alpha_t = self.alpha_t(t)
-        return alpha_t * x0
-
-    def sample(self, x0: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Sample from probability path: x_t = α_t * x0 + σ_t * ε
-
+    def sample(self, x_1: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
+        """Sample from path at time t: γ_t = α(t) x_1 + σ(t) ε.
+        
         Args:
-            x0: Data point (action sequence)
-            t: Time index(es)
-
+            x_1: Data sample (batch_size, action_dim)
+            t: Time steps (batch_size,), normalized to [0, 1]
+        
         Returns:
-            (x_t, eps): Noisy sample and noise used
+            (x_t, epsilon): Noisy sample and noise
         """
-        if isinstance(t, float):
-            t = torch.tensor(t, device=x0.device, dtype=x0.dtype)
-        if t.dim() == 0:
-            t = t.unsqueeze(0)
-
-        while t.dim() < x0.dim():
-            t = t.unsqueeze(-1)
-
-        alpha_t = self.alpha_t(t)
-        sigma_t = self.sigma_t(t)
-
-        eps = torch.randn_like(x0)
-        x_t = alpha_t * x0 + sigma_t * eps
-
+        eps = torch.randn_like(x_1)
+        
+        alpha_t = self.alpha_t(t.view(-1, 1))
+        sigma_t = self.sigma_t(t.view(-1, 1))
+        
+        x_t = alpha_t * x_1 + sigma_t * eps
+        
         return x_t, eps
-
-    def score_function(self, x_t: Tensor, t: Tensor, x0: Tensor) -> Tensor:
-        """
-        Score function: ∇_{x_t} log p_t(x_t|x0) = -(x_t - α_t*x0) / σ_t²
-
-        Theory: Used for score matching training in diffusion policies.
-        """
-        if isinstance(t, float):
-            t = torch.tensor(t, device=x_t.device, dtype=x_t.dtype)
-        if t.dim() == 0:
-            t = t.unsqueeze(0)
-
-        while t.dim() < x_t.dim():
-            t = t.unsqueeze(-1)
-
-        alpha_t = self.alpha_t(t)
-        sigma_t = self.sigma_t(t)
-
-        mu_t = alpha_t * x0
-        score = -(x_t - mu_t) / (sigma_t.pow(2) + 1e-8)
-
-        return score
 
 
 class GeneratorMatchingLoss(nn.Module):
-    """
-    Conditional Generator Matching (CGM) Loss (Section 3.4, 4.3).
-
-    Theory:
-    - L_CGM(θ) = E_{t,z,x~p_t(·|z)} [D(F_t^z(x), F_t^θ(x))]
-    - Proposition 2: ∇L_CGM = ∇L_GM (same gradient as marginal)
-    - Special case: DDPM noise prediction MSE loss
-    - Reduces to standard diffusion objective for quadratic Bregman divergence
-
-    References:
-    - Section 4.3: Training objective as conditional generator matching
-    - Section 3.4: Generator matching loss and CGM
+    """Conditional Generator Matching Loss (Section 3.4, 4.3).
+    
+    Implements three variants:
+    - Score Matching: ||∇_x log p(x|h_t) - s_θ(x, h_t)||²
+    - Flow Matching: ||u_θ(x, h_t) - u_t(x)||²
+    - Bregman: Divergence-based matching
     """
 
-    def __init__(self, action_dim: int, loss_type: str = "score_matching", reduction: str = "mean"):
-        """
+    def __init__(self, action_dim: int, loss_type: str = "score_matching"):
+        """Initialize CGM loss.
+        
         Args:
-            action_dim: Dimension of action space
-            loss_type: 'score_matching', 'flow_matching', 'bregman'
-            reduction: 'mean' or 'sum'
+            action_dim: Dimensionality of action space
+            loss_type: 'score_matching', 'flow_matching', or 'bregman'
         """
         super().__init__()
         self.action_dim = action_dim
         self.loss_type = loss_type
-        self.reduction = reduction
 
     def forward(
         self,
         diffusion_pred: Tensor,
         diffusion_target: Tensor,
-        weights: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Dict]:
-        """
-        Compute CGM loss.
-
+        flow_pred: Optional[Tensor] = None,
+        flow_target: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Dict[str, Any]]:
+        """Compute CGM loss.
+        
         Args:
-            diffusion_pred: Model predictions, shape (batch_size, horizon, action_dim)
-            diffusion_target: Target values (e.g., noise), same shape
-            weights: Optional sample weights
-
+            diffusion_pred: Model score/noise prediction
+            diffusion_target: True score/target noise
+            flow_pred: Optional flow velocity prediction
+            flow_target: Optional target flow
+        
         Returns:
-            (loss, metrics_dict)
+            (loss, metrics): Loss value and diagnostic metrics
         """
-        # Quadratic Bregman divergence (MSE)
-        loss = F.mse_loss(diffusion_pred, diffusion_target, reduction="none")
-        loss = loss.mean(dim=-1)  # Average over action dims
+        metrics = {}
 
-        if weights is not None:
-            loss = loss * weights
-            loss_value = loss.sum() / (weights.sum() + 1e-8)
-        else:
-            if self.reduction == "mean":
-                loss_value = loss.mean()
+        if self.loss_type == "score_matching":
+            loss = self._score_matching_loss(diffusion_pred, diffusion_target)
+            metrics["score_mse"] = loss.item()
+
+        elif self.loss_type == "flow_matching":
+            if flow_pred is not None and flow_target is not None:
+                loss = torch.nn.functional.mse_loss(flow_pred, flow_target)
+                metrics["flow_mse"] = loss.item()
             else:
-                loss_value = loss.sum()
+                loss = torch.nn.functional.mse_loss(diffusion_pred, diffusion_target)
+                metrics["score_mse"] = loss.item()
 
-        return loss_value, {"gm_loss_value": loss_value.item()}
+        elif self.loss_type == "bregman":
+            loss = self._bregman_loss(diffusion_pred, diffusion_target)
+            metrics["bregman"] = loss.item()
 
-
-class SafetyConstrainedSampler(nn.Module):
-    """
-    Enforces safety constraints for hardware deployment (Section 6.1).
-
-    Theory: Hardware safety constraints on SO-101 include:
-    - Maximum action norm (velocity/acceleration limits)
-    - Safety margin (feasibility guarantee)
-    - Joint position limits
-    - Gripper constraints
-
-    Projects action samples to satisfy these constraints without retraining.
-    """
-
-    def __init__(
-        self,
-        max_action_norm: float = 1.0,
-        safety_margin: float = 0.9,
-        joint_limits: Optional[Tuple[Tensor, Tensor]] = None,
-    ):
-        """
-        Args:
-            max_action_norm: Maximum action magnitude
-            safety_margin: Margin factor (< 1.0 for guarantee)
-            joint_limits: (min_positions, max_positions) for clipping
-        """
-        super().__init__()
-        self.max_action_norm = max_action_norm
-        self.safety_margin = safety_margin
-        self.joint_limits = joint_limits
-
-    def forward(self, actions: Tensor) -> Tensor:
-        """
-        Project actions to safe region.
-
-        Args:
-            actions: Action sequences, shape (batch_size, horizon, action_dim)
-
-        Returns:
-            Safe actions with constraints satisfied
-        """
-        safe_actions = actions.clone()
-
-        # Norm constraint (action velocity limits)
-        norms = torch.norm(safe_actions, dim=-1, keepdim=True)
-        scaling = torch.minimum(
-            torch.ones_like(norms),
-            (self.max_action_norm * self.safety_margin) / (norms + 1e-8),
-        )
-        safe_actions = safe_actions * scaling
-
-        # Joint limits (if provided)
-        if self.joint_limits is not None:
-            min_pos, max_pos = self.joint_limits
-            safe_actions = torch.clamp(safe_actions, min=min_pos, max=max_pos)
-
-        return safe_actions
-
-
-class JumpProcessGenerator(nn.Module):
-    """
-    Jump process component of Markov generator (Section 3.3).
-
-    Theory: L^jump_t models abrupt strategy shifts via Poisson jumps.
-    Useful for mode switching in tasks (regrasp attempts, approach angle changes).
-
-    Markov decomposition: L_t = L^flow_t + L^diff_t + L^jump_t + L^CTMC_t
-    """
-
-    def __init__(self, action_dim: int, num_modes: int = 4, jump_rate: float = 0.1):
-        """
-        Args:
-            action_dim: Action space dimension
-            num_modes: Number of discrete modes/strategies
-            jump_rate: Poisson jump rate parameter
-        """
-        super().__init__()
-        self.action_dim = action_dim
-        self.num_modes = num_modes
-        self.jump_rate = jump_rate
-
-        # Transition matrix Q_t(y|x) for mode switches
-        self.transition_matrix = nn.Parameter(
-            torch.eye(num_modes) + torch.randn(num_modes, num_modes) * 0.1
-        )
-
-    def forward(self, x: Tensor, t: float) -> Tensor:
-        """
-        Sample from jump process at time t.
-
-        Args:
-            x: Current action state
-            t: Time index
-
-        Returns:
-            New action state after potential jump
-        """
-        # Probability of jump
-        jump_prob = 1.0 - torch.exp(torch.tensor(-self.jump_rate * t))
-
-        if torch.rand(1) < jump_prob:
-            # Apply mode transition with magnitude change
-            mode_idx = torch.multinomial(torch.ones(self.num_modes), 1)
-            scale = torch.randn(1) * 0.5 + 1.0
-            return x * scale
         else:
-            return x
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
+        return loss, metrics
 
-class CTMCGenerator(nn.Module):
-    """
-    Continuous-Time Markov Chain (CTMC) generator for discrete modes (Section 3.3).
+    def _score_matching_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        """Score matching: MSE between score predictions."""
+        return torch.nn.functional.mse_loss(pred, target)
 
-    Theory: Operates on discrete skill/behavior space with rate matrix Q,
-    complementing continuous flow and diffusion generators for hierarchical policy.
-
-    Synthesis matrix row: CTMC in R^(d_A * H) with rate matrix Q_t.
-    """
-
-    def __init__(self, num_skills: int, skill_dim: int = 64):
-        """
-        Args:
-            num_skills: Number of discrete skills/modes
-            skill_dim: Embedding dimension for skills
-        """
-        super().__init__()
-        self.num_skills = num_skills
-        self.skill_embeddings = nn.Embedding(num_skills, skill_dim)
-
-        # Rate matrix Q for CTMC
-        self.rate_matrix = nn.Parameter(torch.randn(num_skills, num_skills) * 0.1)
-
-    def forward(self, current_skill: int, t: float) -> Tensor:
-        """
-        Sample next skill from CTMC transition.
-
-        Args:
-            current_skill: Current skill index
-            t: Time duration
-
-        Returns:
-            Skill embedding for next state
-        """
-        # Compute transition probabilities from rate matrix
-        rates = torch.exp(self.rate_matrix * t)
-        probs = torch.softmax(rates[current_skill], dim=0)
-
-        # Sample next skill
-        next_skill = torch.multinomial(probs, 1).item()
-
-        return self.skill_embeddings(torch.tensor([next_skill]))
+    def _bregman_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        """Bregman divergence for distribution matching."""
+        # Approximate via KL divergence on softmax
+        pred_dist = torch.softmax(pred, dim=-1)
+        target_dist = torch.softmax(target, dim=-1)
+        return torch.nn.functional.kl_div(
+            torch.log(pred_dist + 1e-8),
+            target_dist,
+            reduction="mean"
+        )
 
 
 class FlowMatchingGenerator(nn.Module):
-    """
-    Flow matching generator - deterministic behavior cloning (Section 3.3, 5.3).
-
-    Theory: L^flow_t corresponds to ODE drift field u_t(x),
-    modeling smooth deterministic behavior (e.g., simple reaching).
-
-    Synthesis matrix row: ODE generator [L_t f](x) = ∇f · u_t(x).
+    """Flow/ODE generator for deterministic behavior cloning (Section 3.3).
+    
+    Learns velocity field v_θ(a_t, t) that generates action trajectories
+    via ODE: da_t/dt = v_θ(a_t, t)
+    
+    Loss: L^flow_t = ||v_θ(γ_t) - u_t||²
     """
 
     def __init__(self, action_dim: int, hidden_dim: int = 128):
-        """
+        """Initialize flow velocity network.
+        
         Args:
-            action_dim: Action space dimension
-            hidden_dim: Hidden layer size for velocity field
+            action_dim: Dimensionality of action space
+            hidden_dim: Hidden layer dimension
         """
         super().__init__()
         self.action_dim = action_dim
-
-        # Neural network parameterizing flow velocity field
+        
         self.velocity_net = nn.Sequential(
-            nn.Linear(action_dim, hidden_dim),
+            nn.Linear(action_dim + 1, hidden_dim),  # +1 for time t
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim),
         )
 
-    def forward(self, x: Tensor, t: float) -> Tensor:
-        """
-        Compute velocity field u_t(x).
-
+    def forward(self, a_t: Tensor, t: float = 0.5) -> Tensor:
+        """Predict velocity v_θ(a_t, t).
+        
         Args:
-            x: Current action state
-            t: Time index (unused, for interface compatibility)
-
+            a_t: Action at current time (batch_size, action_dim)
+            t: Time step in [0, 1]
+        
         Returns:
-            Velocity/drift at current state
+            velocity: Predicted velocity (batch_size, action_dim)
         """
-        return self.velocity_net(x)
+        batch_size = a_t.shape[0]
+        t_tensor = torch.full((batch_size, 1), t, device=a_t.device)
+        
+        augmented = torch.cat([a_t, t_tensor], dim=-1)
+        velocity = self.velocity_net(augmented)
+        
+        return velocity
 
 
-class RewardTiltedDistribution(nn.Module):
+class JumpProcessGenerator(nn.Module):
+    """Jump Process generator for discrete mode switches (Section 3.3, Table 7).
+    
+    Modeled as Poisson jump process with mode switching.
+    Jump intensity λ_t and transition probabilities learned.
+    
+    Loss: L^jump_t = KL[π_θ(·|h_t) || π_target]
     """
-    Reward-tilted distribution for alignment (Section 6.1).
 
-    Theory: Gibbs tilt - π_β(x) ∝ p_base(x) * exp(β * r(x))
-
-    Used in inference-time alignment to reweight samples toward high-reward regions
-    without retraining the base policy.
-    """
-
-    def __init__(self, reward_temperature: float = 1.0):
-        """
+    def __init__(self, action_dim: int, num_modes: int = 4, jump_rate: float = 0.1):
+        """Initialize jump process generator.
+        
         Args:
-            reward_temperature: β parameter controlling tilt strength
-        """
-        super().__init__()
-        self.reward_temperature = reward_temperature
-
-    def forward(
-        self,
-        base_log_prob: Tensor,
-        reward: Tensor,
-    ) -> Tensor:
-        """
-        Compute log probability under Gibbs tilt.
-
-        log π_β(x) = log p_base(x) + β * r(x) - log Z
-
-        Args:
-            base_log_prob: Log probability under base distribution
-            reward: Reward value r(x)
-
-        Returns:
-            Log probability under reward-tilted distribution
-        """
-        # Unnormalized log probability (log Z cancels in softmax)
-        log_prob = base_log_prob + self.reward_temperature * reward
-
-        return log_prob
-
-
-class SequentialMonteCarloSampler(nn.Module):
-    """
-    Sequential Monte Carlo sampler for reward alignment (Section 6.3).
-
-    Theory: Maintains particle set through denoising steps,
-    reweighting by value function at each step. Implements:
-
-    Modified reverse kernel: p̃_{k-1}(A_{k-1}|A_k) ∝ p^pre_{k-1}(A_{k-1}|A_k) v^r_{k-1}(A_{k-1})
-    """
-
-    def __init__(self, num_particles: int = 32, resample_threshold: float = 0.5):
-        """
-        Args:
-            num_particles: Number of particles to maintain
-            resample_threshold: Effective sample size threshold for resampling
-        """
-        super().__init__()
-        self.num_particles = num_particles
-        self.resample_threshold = resample_threshold
-
-    def forward(
-        self,
-        initial_samples: Tensor,
-        value_fn: Callable,
-        num_steps: int = 10,
-    ) -> Tensor:
-        """
-        Run SMC over denoising steps.
-
-        Args:
-            initial_samples: Initial particle set (batch_size * num_particles, ...)
-            value_fn: Value function for reweighting
-            num_steps: Number of SMC steps
-
-        Returns:
-            Refined samples with higher expected value
-        """
-        particles = initial_samples
-        weights = torch.ones(initial_samples.shape[0]) / self.num_particles
-
-        for step in range(num_steps):
-            # Compute values for reweighting
-            values = value_fn(particles)
-            weights = weights * torch.softmax(values, dim=0)
-
-            # Normalize weights
-            weights = weights / (weights.sum() + 1e-8)
-
-            # Check effective sample size
-            ess = 1.0 / ((weights ** 2).sum() + 1e-8)
-            if ess < self.resample_threshold * self.num_particles:
-                # Resample
-                indices = torch.multinomial(weights, self.num_particles, replacement=True)
-                particles = particles[indices]
-                weights = torch.ones_like(weights) / self.num_particles
-
-        return particles
-
-
-class EnergyBasedGeneratorMatching(nn.Module):
-    """
-    Energy-Based Generator Matching (EGM) for reward alignment (Section 6.5).
-
-    Theory: Treats reward as energy, defining unnormalized target law
-    π(x) ∝ exp(-E(x)) with E(x) = -r(x).
-
-    Useful when aligned target known only up to normalizing constant,
-    common in multi-objective SO-101 rewards with safety constraints.
-    """
-
-    def __init__(self, action_dim: int):
-        """
-        Args:
-            action_dim: Action space dimension
+            action_dim: Dimensionality of action space
+            num_modes: Number of discrete modes
+            jump_rate: Poisson jump rate λ_t
         """
         super().__init__()
         self.action_dim = action_dim
+        self.num_modes = num_modes
+        self.jump_rate = jump_rate
+        
+        # Mode-specific action predictors
+        self.mode_embeddings = nn.Embedding(num_modes, 64)
+        
+        self.transition_net = nn.Sequential(
+            nn.Linear(action_dim + 64, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_modes),
+        )
+        
+        # Jump rate predictor
+        self.rate_net = nn.Sequential(
+            nn.Linear(action_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Softplus(),
+        )
 
-    def forward(self, actions: Tensor, rewards: Tensor) -> Tensor:
-        """
-        Compute EGM loss for unnormalized reward-tilted distribution.
-
+    def forward(self, a_t: Tensor, t: float = 0.5) -> Tensor:
+        """Predict mode transition probabilities.
+        
         Args:
-            actions: Action samples
-            rewards: Reward values
-
+            a_t: Action (batch_size, action_dim)
+            t: Time step
+        
         Returns:
-            Loss for score matching under exp(-E(x))
+            logits: Mode logits (batch_size, num_modes)
         """
-        # Energy = negative reward
-        energy = -rewards
+        batch_size = a_t.shape[0]
+        
+        # Current mode embedding (sample for now)
+        current_mode = torch.randint(0, self.num_modes, (batch_size,), device=a_t.device)
+        mode_emb = self.mode_embeddings(current_mode)
+        
+        # Transition logits
+        augmented = torch.cat([a_t, mode_emb], dim=-1)
+        logits = self.transition_net(augmented)
+        
+        return logits
 
-        # Score matching loss for unnormalized model
-        loss = (energy ** 2).mean()
+    def sample_jump_time(self, batch_size: int, device: torch.device) -> Tensor:
+        """Sample jump time from exponential distribution."""
+        lambda_t = self.jump_rate
+        u = torch.rand(batch_size, device=device)
+        t_jump = -torch.log(u + 1e-8) / lambda_t
+        return torch.clamp(t_jump, 0, 1)
 
-        return loss
+
+class CTMCGenerator(nn.Module):
+    """CTMC (Continuous-Time Markov Chain) generator for discrete skills (Section 3.3, Table 7).
+    
+    High-level skill/mode switching via rate matrix Q.
+    Models skill transitions as continuous-time Markov process.
+    
+    Loss: L^CTMC_t = cross_entropy[s_t^pred, s_t^target]
+    """
+
+    def __init__(self, num_skills: int, skill_dim: int = 64):
+        """Initialize CTMC generator.
+        
+        Args:
+            num_skills: Number of discrete skills/modes
+            skill_dim: Skill embedding dimension
+        """
+        super().__init__()
+        self.num_skills = num_skills
+        self.skill_dim = skill_dim
+        
+        # Skill embeddings
+        self.skill_embeddings = nn.Embedding(num_skills, skill_dim)
+        
+        # Rate matrix Q (transition rates)
+        self.rate_matrix_net = nn.Sequential(
+            nn.Linear(skill_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_skills),
+        )
+        
+        # Transition probability predictor
+        self.transition_net = nn.Sequential(
+            nn.Linear(skill_dim + 1, 128),  # +1 for time
+            nn.ReLU(),
+            nn.Linear(128, num_skills),
+        )
+
+    def forward(self, current_skill: Tensor, t: float = 0.5) -> Tensor:
+        """Predict next skill logits.
+        
+        Args:
+            current_skill: Current skill index (batch_size,)
+            t: Time step in [0, 1]
+        
+        Returns:
+            logits: Next skill logits (batch_size, num_skills)
+        """
+        batch_size = current_skill.shape[0]
+        device = current_skill.device
+        
+        # Get skill embedding
+        skill_emb = self.skill_embeddings(current_skill)
+        
+        # Rate matrix
+        Q = self.rate_matrix_net(skill_emb)
+        
+        # Time augmented
+        t_tensor = torch.full((batch_size, 1), t, device=device)
+        augmented = torch.cat([skill_emb, t_tensor], dim=-1)
+        
+        # Transition logits
+        logits = self.transition_net(augmented)
+        
+        return logits
+
+    def matrix_exponential(self, Q: Tensor, t: float) -> Tensor:
+        """Compute matrix exponential e^{Qt} for transition probabilities."""
+        # Simplified: use diagonal approximation
+        I = torch.eye(Q.shape[-1], device=Q.device)
+        P_t = I + t * Q / (torch.norm(Q, dim=-1, keepdim=True) + 1e-8)
+        return P_t
+
+
+class SafetyConstrainedSampler(nn.Module):
+    """Safety-constrained action sampler (Section 6.1).
+    
+    Projects actions to safe region while maximizing likelihood.
+    """
+
+    def __init__(self, max_action_norm: float = 0.1):
+        """Initialize safety sampler.
+        
+        Args:
+            max_action_norm: Maximum L2 norm of action
+        """
+        super().__init__()
+        self.max_action_norm = max_action_norm
+
+    def forward(self, action: Tensor) -> Tensor:
+        """Project action to safe region.
+        
+        Args:
+            action: Action (batch_size, action_dim)
+        
+        Returns:
+            safe_action: Projected action
+        """
+        action_norm = torch.norm(action, p=2, dim=-1, keepdim=True)
+        scale = torch.clamp(self.max_action_norm / (action_norm + 1e-8), max=1.0)
+        safe_action = action * scale
+        return safe_action
+
+
+class MarkovSuperpositionGate(nn.Module):
+    """Learned gating for Markov superposition (Section 3.5, 5.3).
+    
+    Learns convex weights w_i(h_t) for component blending:
+    L_t = Σ w_i(h_t) L_t^(i)
+    """
+
+    def __init__(self, observation_dim: int, num_components: int, hidden_dim: int = 128):
+        """Initialize gating network.
+        
+        Args:
+            observation_dim: Observation/history dimensionality
+            num_components: Number of loss components
+            hidden_dim: Hidden layer dimension
+        """
+        super().__init__()
+        self.num_components = num_components
+        
+        self.gate_net = nn.Sequential(
+            nn.Linear(observation_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_components),
+            nn.Softmax(dim=-1),
+        )
+
+    def forward(self, h_t: Tensor) -> Tensor:
+        """Compute gating weights.
+        
+        Args:
+            h_t: History/observation (batch_size, observation_dim)
+        
+        Returns:
+            weights: Convex weights (batch_size, num_components)
+        """
+        return self.gate_net(h_t)
+
+
+class ProbabilityPathDensity:
+    """Density computation along probability paths."""
+
+    def __init__(self, path: GaussianCondOTPath):
+        """Initialize with probability path."""
+        self.path = path
+
+    def log_density(self, x_t: Tensor, x_1: Tensor, t: Tensor) -> Tensor:
+        """Log density of x_t on path at time t."""
+        alpha_t = self.path.alpha_t(t.view(-1, 1))
+        sigma_t = self.path.sigma_t(t.view(-1, 1))
+        
+        # Gaussian approximation: -0.5 * ||x_t - α(t)x_1||² / σ(t)²
+        residual = x_t - alpha_t * x_1
+        log_p = -0.5 * (residual ** 2).sum(dim=-1) / (sigma_t ** 2 + 1e-8)
+        
+        return log_p
