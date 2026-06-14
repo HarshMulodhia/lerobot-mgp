@@ -32,6 +32,7 @@ Theory References:
 """
 
 import logging
+import copy
 from typing import Any, Dict, Optional, Tuple, Callable
 
 import torch
@@ -247,50 +248,47 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         Prepare conditioning batch by concatenating multi-camera observations.
         
         Handles remapped camera keys (camera1, camera2, ...) by:
-        1. Detecting all remapped cameras in observation.images
+        1. Detecting all remapped cameras in nested observation.images dict
         2. Concatenating them along the channel dimension
-        3. Replacing with concatenated tensor for GM loss computation
+        3. Creating observation.images key for compatibility with parent class
         
         Args:
             batch: Training batch with potentially remapped camera observations
         
         Returns:
-            Modified batch with concatenated camera observations
+            Modified batch with concatenated camera observations under observation.images
         """
-        conditioning_batch = batch.copy()
-        obs = batch.get("observation", {})
+        conditioning_batch = copy.deepcopy(batch)
         
-        if not hasattr(obs, "images"):
-            return conditioning_batch
-        
-        images_dict = obs.images
-        
-        # Detect remapped camera keys (camera1, camera2, ...)
-        camera_keys = sorted([k for k in images_dict.keys() if k.startswith("camera")])
-        
-        if camera_keys and len(camera_keys) > 1:
-            # Multiple cameras found - concatenate them
-            try:
-                camera_tensors = [images_dict[k] for k in camera_keys]
-                # Concatenate along channel dimension (dim=-3 for (B, C, H, W) or (B, T, C, H, W))
-                concatenated_images = torch.cat(camera_tensors, dim=-3)
-                
-                # Create new observation with concatenated images
-                new_obs = obs.copy() if hasattr(obs, "copy") else dict(obs)
-                if isinstance(new_obs, dict):
-                    new_images_dict = dict(images_dict)
-                    new_images_dict["images"] = concatenated_images
-                    new_obs["images"] = new_images_dict
-                else:
-                    # Handle namespace/object-like observation
-                    new_obs.images = dict(images_dict)
-                    new_obs.images["images"] = concatenated_images
-                
-                conditioning_batch["observation"] = new_obs
-            except Exception as e:
-                logger.debug(f"Multi-camera concatenation failed: {e}, using original observations")
-                # Fall back to original batch on any error
-                pass
+        try:
+            obs = conditioning_batch.get("observation", {})
+            
+            if isinstance(obs, dict) and "images" in obs:
+                images_dict = obs["images"]
+                if isinstance(images_dict, dict):
+                    # Detect remapped camera keys (camera1, camera2, ...)
+                    camera_keys = sorted([k for k in images_dict.keys() if k.startswith("camera")])
+                    
+                    if len(camera_keys) > 1:
+                        # Multiple cameras found - concatenate them
+                        camera_tensors = [images_dict[k] for k in camera_keys]
+                        # Concatenate along channel dimension (dim=-3 for (B, C, H, W) or (B, T, C, H, W))
+                        concatenated_images = torch.cat(camera_tensors, dim=-3)
+                        
+                        # Replace the entire images dict with concatenated tensor
+                        # This ensures _prepare_global_conditioning can find observation.images
+                        conditioning_batch["observation"]["images"] = concatenated_images
+                    elif len(camera_keys) == 1:
+                        # Single camera - just use it directly
+                        conditioning_batch["observation"]["images"] = images_dict[camera_keys[0]]
+                    else:
+                        # No camera keys - check for original images key
+                        if "images" in images_dict:
+                            conditioning_batch["observation"]["images"] = images_dict["images"]
+        except Exception as e:
+            logger.debug(f"Multi-camera concatenation failed: {e}, using original observations")
+            # Fall back to original batch on any error
+            pass
         
         return conditioning_batch
 
