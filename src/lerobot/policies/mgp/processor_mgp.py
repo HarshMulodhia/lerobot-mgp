@@ -13,22 +13,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any
 
-import torch
+"""
+Data processors for MGP (Markov Generator Policy).
 
-from lerobot.processor import PolicyAction, PolicyProcessorPipeline
+Inherits from DiffusionPolicy processors - MGP uses same preprocessing.
+"""
 
-from ..diffusion.processor_diffusion import make_diffusion_pre_post_processors
-from .configuration_mgp import MGPConfig
+from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
 
 
-def make_mgp_pre_post_processors(
-    config: MGPConfig,
-    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-) -> tuple[
-    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    PolicyProcessorPipeline[PolicyAction, PolicyAction],
-]:
-    """Create the pre/post processors for MGP."""
-    return make_diffusion_pre_post_processors(config=config, dataset_stats=dataset_stats)
+def make_mgp_pre_post_processors(config, dataset_stats=None):
+    """
+    Create preprocessing and postprocessing functions for MGP.
+
+    MGP uses the same data processing as DiffusionPolicy.
+    This is a convenience wrapper for consistency with other policies.
+
+    Args:
+        config: MGPConfig instance
+        dataset_stats: Dataset statistics for normalization
+
+    Returns:
+        (preprocess_fn, postprocess_fn): Preprocessing and postprocessing functions
+    """
+    return make_diffusion_pre_post_processors(config, dataset_stats)
