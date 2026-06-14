@@ -160,63 +160,71 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         self.kl_weight = 0.1  # Regularization weight against base policy
         logger.info("Post-training alignment initialized")
 
-    def _prepare_multi_camera_conditioning(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    def _is_observation_images_concatenated(self, obs: Any) -> bool:
+        """Check if observation.images has been properly concatenated into a single tensor."""
+        if not hasattr(obs, "images"):
+            return False
+        img = obs.images
+        # A properly concatenated observation.images should be a Tensor
+        return isinstance(img, Tensor)
+
+    def _concatenate_multi_camera_observations(self, obs: Any) -> Any:
         """
-        Prepare conditioning batch by concatenating multi-camera observations.
+        Concatenate multi-camera observations if they are dict of cameras.
         
-        Handles remapped camera keys (camera1, camera2, ...) by:
-        1. Detecting all remapped cameras in nested observation.images dict
-        2. Concatenating them along the channel dimension
-        3. Creating observation.images key for compatibility with parent class
-        
-        This MUST be called before super().forward() to fix the batch structure
-        for the parent DiffusionPolicy class.
-        
-        Args:
-            batch: Training batch with potentially remapped camera observations
-        
-        Returns:
-            Modified batch with concatenated camera observations under observation.images
+        Returns the modified observation or the original if it can't be concatenated.
         """
-        try:
-            obs = batch.get("observation", None)
-            if obs is None:
-                return batch
-            
-            # obs can be a dict-like object or a namespace
-            if hasattr(obs, "images"):
-                images_attr = obs.images
+        if not hasattr(obs, "images"):
+            return obs
+        
+        images_attr = obs.images
+        if not isinstance(images_attr, dict):
+            # Already a tensor or something else, return as is
+            return obs
+        
+        # It's a dict of cameras - concatenate them
+        camera_keys = sorted([k for k in images_attr.keys() if k.startswith("camera")])
+        
+        if len(camera_keys) > 1:
+            try:
+                logger.debug(f"Concatenating {len(camera_keys)} cameras: {camera_keys}")
+                camera_tensors = [images_attr[k] for k in camera_keys]
+                concatenated = torch.cat(camera_tensors, dim=-3)
                 
-                # If images is a dict (remapped cameras)
-                if isinstance(images_attr, dict):
-                    # Detect remapped camera keys (camera1, camera2, ...)
-                    camera_keys = sorted([k for k in images_attr.keys() if k.startswith("camera")])
-                    
-                    if len(camera_keys) > 1:
-                        # Multiple cameras found - concatenate them
-                        logger.debug(f"Found {len(camera_keys)} cameras: {camera_keys}")
-                        camera_tensors = [images_attr[k] for k in camera_keys]
-                        # Concatenate along channel dimension (dim=-3 for (B, C, H, W) or (B, T, C, H, W))
-                        concatenated_images = torch.cat(camera_tensors, dim=-3)
-                        
-                        # Create a copy of batch and modify observation.images
-                        batch_copy = copy.deepcopy(batch)
-                        batch_copy["observation"].images = concatenated_images
-                        logger.debug(f"Concatenated {len(camera_keys)} cameras into shape {concatenated_images.shape}")
-                        return batch_copy
-                    elif len(camera_keys) == 1:
-                        # Single camera - extract it as the images tensor
-                        logger.debug(f"Found single camera: {camera_keys[0]}")
-                        batch_copy = copy.deepcopy(batch)
-                        batch_copy["observation"].images = images_attr[camera_keys[0]]
-                        return batch_copy
-                    # else: no camera keys, leave as is
-        except Exception as e:
-            logger.debug(f"Multi-camera preparation failed: {e}")
-            # Fall back to original batch on any error
-            pass
-        
-        return batch
+                # Modify in place if possible, or return new object
+                if hasattr(obs, "__dict__"):
+                    obs.images = concatenated
+                else:
+                    # Create a copy if it's a frozen object
+                    obs_dict = dict(vars(obs))
+                    obs_dict["images"] = concatenated
+                    # Return as namespace-like object
+                    from types import SimpleNamespace
+                    obs = SimpleNamespace(**obs_dict)
+                
+                logger.debug(f"Concatenated into shape {concatenated.shape}")
+                return obs
+            except Exception as e:
+                logger.debug(f"Failed to concatenate cameras: {e}")
+                return obs
+        elif len(camera_keys) == 1:
+            # Single camera - just extract it
+            try:
+                logger.debug(f"Extracting single camera: {camera_keys[0]}")
+                if hasattr(obs, "__dict__"):
+                    obs.images = images_attr[camera_keys[0]]
+                else:
+                    obs_dict = dict(vars(obs))
+                    obs_dict["images"] = images_attr[camera_keys[0]]
+                    from types import SimpleNamespace
+                    obs = SimpleNamespace(**obs_dict)
+                return obs
+            except Exception as e:
+                logger.debug(f"Failed to extract single camera: {e}")
+                return obs
+        else:
+            # No camera keys
+            return obs
 
     def forward(self, batch: Dict[str, Tensor]) -> Tuple[Tensor, Optional[Dict[str, Any]]]:
         """
@@ -231,9 +239,13 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         Returns:
             (loss, output_dict): Combined loss and metrics
         """
-        # Fix multi-camera batch structure BEFORE calling parent forward
-        # This ensures observation.images is a tensor, not a dict of cameras
-        batch = self._prepare_multi_camera_conditioning(batch)
+        # Try to concatenate multi-camera observations
+        try:
+            obs = batch.get("observation", None)
+            if obs is not None:
+                batch["observation"] = self._concatenate_multi_camera_observations(obs)
+        except Exception as e:
+            logger.debug(f"Multi-camera concatenation in forward failed: {e}")
         
         # Standard DiffusionPolicy loss (parent class)
         loss_diffusion, output_dict = super().forward(batch)
@@ -247,13 +259,22 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         output_dict["mgp_enabled"] = self.config.use_generator_matching
 
         # ===== SECTION 4.3: Add CGM Loss =====
+        # Only compute GM loss if:
+        # 1. GM is enabled in config
+        # 2. ACTION is in batch
+        # 3. Observations are in a format we can handle (images must be concatenated)
         if self.config.use_generator_matching and ACTION in batch:
-            try:
-                loss_diffusion, output_dict = self._compute_gm_loss(
-                    batch, loss_diffusion, output_dict
-                )
-            except Exception as e:
-                logger.warning(f"GM loss computation failed: {e}, using diffusion loss only")
+            # Check if observations are properly formatted
+            obs = batch.get("observation", None)
+            if obs is not None and self._is_observation_images_concatenated(obs):
+                try:
+                    loss_diffusion, output_dict = self._compute_gm_loss(
+                        batch, loss_diffusion, output_dict
+                    )
+                except Exception as e:
+                    logger.warning(f"GM loss computation failed: {e}, using diffusion loss only")
+            else:
+                logger.debug("Skipping GM loss: observation.images is not properly concatenated")
 
         return loss_diffusion, output_dict
 
@@ -268,6 +289,8 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         - Sample noisy actions from conditional path
         - Compute noise prediction error
         - Combine with diffusion loss
+        
+        NOTE: Assumes batch observation.images is already a concatenated Tensor.
         """
         actions = batch[ACTION]
         batch_size = actions.shape[0]
@@ -280,6 +303,7 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         x_t, eps = self.prob_path.sample(actions, t)
 
         # Section 4.2: Forward through U-Net to get noise prediction
+        # At this point batch should have concatenated observation.images
         global_cond = self.diffusion._prepare_global_conditioning(batch)
         noise_pred = self.diffusion.unet(x_t, timesteps, global_cond=global_cond)
 
