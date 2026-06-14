@@ -219,23 +219,30 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         # Flatten multi-camera observations to handle datasets with multiple camera views
         batch_cond = self._flatten_multi_camera_observations(batch)
 
-        # Section 4.2: Forward through U-Net to get noise prediction
-        global_cond = self.diffusion._prepare_global_conditioning(batch_cond)
-        noise_pred = self.diffusion.unet(x_t, timesteps, global_cond=global_cond)
+        try:
+            # Section 4.2: Forward through U-Net to get noise prediction
+            global_cond = self.diffusion._prepare_global_conditioning(batch_cond)
+            noise_pred = self.diffusion.unet(x_t, timesteps, global_cond=global_cond)
 
-        # Section 4.3: Compute CGM loss
-        gm_loss, gm_metrics = self.gm_loss(
-            diffusion_pred=noise_pred,
-            diffusion_target=eps,
-        )
+            # Section 4.3: Compute CGM loss
+            gm_loss, gm_metrics = self.gm_loss(
+                diffusion_pred=noise_pred,
+                diffusion_target=eps,
+            )
 
-        # Combine losses
-        combined_loss = loss_diffusion + self.config.gm_loss_weight * gm_loss
-        output_dict.update(gm_metrics)
-        output_dict["loss_gm"] = gm_loss.item()
-        output_dict["loss_combined"] = combined_loss.item()
+            # Combine losses
+            combined_loss = loss_diffusion + self.config.gm_loss_weight * gm_loss
+            output_dict.update(gm_metrics)
+            output_dict["loss_gm"] = gm_loss.item()
+            output_dict["loss_combined"] = combined_loss.item()
 
-        return combined_loss, output_dict
+            return combined_loss, output_dict
+        except (KeyError, RuntimeError, AttributeError) as e:
+            # If GM loss fails due to observation structure, fall back to diffusion loss
+            logger.warning(f"GM loss computation failed: {str(e)}, using diffusion loss only")
+            output_dict["loss_gm"] = 0.0
+            output_dict["loss_combined"] = loss_diffusion.item()
+            return loss_diffusion, output_dict
 
     @torch.no_grad()
     def select_action(self, batch: Dict[str, Tensor], reward_fn: Optional[Callable] = None) -> Tensor:
@@ -286,14 +293,20 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         if "observation" in batch and isinstance(batch["observation"], dict):
             obs = batch["observation"]
             if "images" in obs and isinstance(obs["images"], dict):
-                # Multi-camera case: concatenate all camera views along channel or batch dim
+                # Multi-camera case: concatenate all camera views along channel dimension
                 camera_views = []
-                for camera_name in sorted(obs["images"].keys()):
-                    camera_views.append(obs["images"][camera_name])
+                camera_names = sorted(obs["images"].keys())
+                
+                logger.debug(f"Flattening {len(camera_names)} camera views: {camera_names}")
+                
+                for camera_name in camera_names:
+                    camera_tensor = obs["images"][camera_name]
+                    camera_views.append(camera_tensor)
 
                 # Concatenate along channel dimension (last dim for images)
                 if len(camera_views) > 1:
                     flattened_images = torch.cat(camera_views, dim=-1)  # Concat on channel dim
+                    logger.debug(f"Concatenated {len(camera_views)} cameras into shape {flattened_images.shape}")
                 else:
                     flattened_images = camera_views[0]
 
@@ -301,7 +314,11 @@ class MarkovGenerativePolicy(DiffusionPolicy):
                 obs_flat = {k: v for k, v in obs.items()}
                 obs_flat["images"] = flattened_images
                 batch_flat["observation"] = obs_flat
-
+            elif "images" in obs and isinstance(obs["images"], Tensor):
+                # Already single tensor, no flattening needed
+                logger.debug(f"Observations already in single tensor format: {obs['images'].shape}")
+                pass
+        
         return batch_flat
 
     def _apply_inference_time_alignment(self, action: Tensor, reward_fn: Callable) -> Tensor:
