@@ -107,8 +107,8 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         logger.info("Initializing Markov Generative Policy (MGP)")
 
         # ===== SECTION 3.1: Probability Paths =====
-        self.prob_path = GaussianCondOTPath(sigma_schedule=self.config.sigma_schedule)
-        logger.info(f"Initialized Gaussian CondOT path with schedule: {self.config.sigma_schedule}")
+        self.prob_path = GaussianCondOTPath(sigma_schedule=self.config.beta_schedule)
+        logger.info(f"Initialized Gaussian CondOT path with schedule: {self.config.beta_schedule}")
 
         # ===== SECTION 3.4 / 4.3: Conditional Generator Matching Loss =====
         if self.config.use_generator_matching:
@@ -216,8 +216,11 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         # Section 3.1: Sample from conditional path x_t = α_t*x_0 + σ_t*ε
         x_t, eps = self.prob_path.sample(actions, t)
 
+        # Flatten multi-camera observations to handle datasets with multiple camera views
+        batch_cond = self._flatten_multi_camera_observations(batch)
+
         # Section 4.2: Forward through U-Net to get noise prediction
-        global_cond = self.diffusion._prepare_global_conditioning(batch)
+        global_cond = self.diffusion._prepare_global_conditioning(batch_cond)
         noise_pred = self.diffusion.unet(x_t, timesteps, global_cond=global_cond)
 
         # Section 4.3: Compute CGM loss
@@ -263,6 +266,43 @@ class MarkovGenerativePolicy(DiffusionPolicy):
             action = self.safety_sampler(action)
 
         return action
+
+    def _flatten_multi_camera_observations(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """
+        Flatten multi-camera observations for conditioning.
+
+        Handles datasets with multiple camera views (e.g., observation.images.up, observation.images.side)
+        by concatenating them into a single observation.images tensor.
+
+        Args:
+            batch: Batch dict potentially with nested multi-camera observations
+
+        Returns:
+            Batch dict with flattened observation.images
+        """
+        batch_flat = {k: v for k, v in batch.items()}
+
+        # Check if we have multi-camera observations
+        if "observation" in batch and isinstance(batch["observation"], dict):
+            obs = batch["observation"]
+            if "images" in obs and isinstance(obs["images"], dict):
+                # Multi-camera case: concatenate all camera views along channel or batch dim
+                camera_views = []
+                for camera_name in sorted(obs["images"].keys()):
+                    camera_views.append(obs["images"][camera_name])
+
+                # Concatenate along channel dimension (last dim for images)
+                if len(camera_views) > 1:
+                    flattened_images = torch.cat(camera_views, dim=-1)  # Concat on channel dim
+                else:
+                    flattened_images = camera_views[0]
+
+                # Create new observation dict with flattened images
+                obs_flat = {k: v for k, v in obs.items()}
+                obs_flat["images"] = flattened_images
+                batch_flat["observation"] = obs_flat
+
+        return batch_flat
 
     def _apply_inference_time_alignment(self, action: Tensor, reward_fn: Callable) -> Tensor:
         """
