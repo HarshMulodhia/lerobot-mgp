@@ -22,6 +22,7 @@ reward alignment options, and hardware safety constraints.
 """
 
 from dataclasses import dataclass, field
+from typing import Dict, Optional
 
 from lerobot.configs import PreTrainedConfig
 
@@ -44,6 +45,23 @@ class MGPConfig(DiffusionConfig if DiffusionConfig else object):
     - Distribution shift adaptation and safety constraints
 
     Fully backward compatible with DiffusionPolicy configurations.
+    
+    Example usage:
+    
+    1. Default (balanced):
+        lerobot-train --policy.type=mgp
+    
+    2. Custom loss weights via dict:
+        lerobot-train --policy.type=mgp \\
+          --policy.loss_weights='{"diffusion": 1.5, "gm": 0.3, "flow": 0.1, "reward": 0.05}'
+    
+    3. Focus on multi-camera learning:
+        lerobot-train --policy.type=mgp \\
+          --policy.loss_weights='{"gm": 0.5}'  # Other weights use defaults
+    
+    4. Smooth baseline prioritization:
+        lerobot-train --policy.type=mgp \\
+          --policy.loss_weights='{"diffusion": 1.0, "flow": 0.2, "gm": 0.05}'
     """
 
     # ===== Generator Matching Components =====
@@ -53,8 +71,39 @@ class MGPConfig(DiffusionConfig if DiffusionConfig else object):
     gm_loss_type: str = "score_matching"
     """Type of GM loss: 'score_matching', 'flow_matching', 'bregman'."""
 
-    gm_loss_weight: float = 0.1
-    """Weight of GM loss relative to diffusion loss."""
+    # ===== Combined Loss Weights (Section 4.3, 5.1) =====
+    # Total Loss: L_total = α*L_DP + β*L_GM + γ*L_FM + λ*L_reward
+    loss_weights: Optional[Dict[str, float]] = field(
+        default_factory=lambda: {
+            "diffusion": 1.0,
+            "gm": 0.1,
+            "flow": 0.05,
+            "reward": 0.01,
+        }
+    )
+    """
+    Combined loss weights for multi-objective training.
+    
+    Keys:
+    - 'diffusion' (α): Primary imitation loss (default=1.0)
+        Higher values prioritize matching demonstration trajectories.
+        Tune: increase to 1.5-2.0 for behavior cloning focused training.
+    
+    - 'gm' (β): Generator matching loss for multi-camera conditioning (default=0.1)
+        Encourages learning multi-camera visual representations.
+        Tune: increase to 0.2-0.5 for stronger visual understanding.
+    
+    - 'flow' (γ): Flow matching loss for deterministic baseline (default=0.05)
+        Adds smooth, deterministic reaching motions as regularization.
+        Tune: increase to 0.1-0.2 for smoother, more predictable policies.
+    
+    - 'reward' (λ): Reward alignment loss (default=0.01)
+        Only active when enable_reward_alignment=True.
+        Tune: increase to 0.05-0.1 when reliable reward signals available.
+    
+    Example via command line:
+        --policy.loss_weights='{"diffusion": 1.5, "gm": 0.3, "flow": 0.1}'
+    """
 
     # ===== Trajectory Sampling =====
     trajectory_horizon: int = 10
