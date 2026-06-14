@@ -216,8 +216,8 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         # Section 3.1: Sample from conditional path x_t = α_t*x_0 + σ_t*ε
         x_t, eps = self.prob_path.sample(actions, t)
 
-        # Flatten multi-camera observations to handle datasets with multiple camera views
-        batch_cond = self._flatten_multi_camera_observations(batch)
+        # Handle renamed multi-camera observations from rename_map
+        batch_cond = self._consolidate_multi_camera_observations(batch)
 
         try:
             # Section 4.2: Forward through U-Net to get noise prediction
@@ -243,6 +243,54 @@ class MarkovGenerativePolicy(DiffusionPolicy):
             output_dict["loss_gm"] = 0.0
             output_dict["loss_combined"] = loss_diffusion.item()
             return loss_diffusion, output_dict
+
+    def _consolidate_multi_camera_observations(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """
+        Consolidate renamed multi-camera observations for conditioning.
+
+        When rename_map is used (e.g., observation.images.side -> observation.images.camera1),
+        the observation structure becomes observation.images.camera1, observation.images.camera2, etc.
+        This method consolidates them back into observation.images dict structure for compatibility
+        with the diffusion policy's _prepare_global_conditioning method.
+
+        Args:
+            batch: Batch dict with potentially renamed observations
+
+        Returns:
+            Batch dict with consolidated observation.images structure
+        """
+        batch_cons = {k: v for k, v in batch.items()}
+
+        if "observation" not in batch or not isinstance(batch["observation"], dict):
+            return batch_cons
+
+        obs = batch["observation"]
+
+        # Check if we already have observation.images as a dict or tensor
+        if "images" in obs and isinstance(obs["images"], (dict, Tensor)):
+            return batch_cons
+
+        # Look for renamed camera keys like images.camera1, images.camera2
+        renamed_camera_keys = [k for k in obs.keys() if isinstance(k, str) and k.startswith("images.")]
+
+        if len(renamed_camera_keys) > 0:
+            # Consolidate renamed cameras into observation.images dict
+            images_dict = {}
+            obs_cons = {}
+
+            for key, value in obs.items():
+                if isinstance(key, str) and key.startswith("images."):
+                    # Extract camera name (e.g., "images.camera1" -> "camera1")
+                    camera_name = key.split(".", 1)[1]
+                    images_dict[camera_name] = value
+                else:
+                    obs_cons[key] = value
+
+            # Add consolidated images dict
+            obs_cons["images"] = images_dict
+            batch_cons["observation"] = obs_cons
+
+        return batch_cons
 
     @torch.no_grad()
     def select_action(self, batch: Dict[str, Tensor], reward_fn: Optional[Callable] = None) -> Tensor:
@@ -273,53 +321,6 @@ class MarkovGenerativePolicy(DiffusionPolicy):
             action = self.safety_sampler(action)
 
         return action
-
-    def _flatten_multi_camera_observations(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        """
-        Flatten multi-camera observations for conditioning.
-
-        Handles datasets with multiple camera views (e.g., observation.images.up, observation.images.side)
-        by concatenating them into a single observation.images tensor.
-
-        Args:
-            batch: Batch dict potentially with nested multi-camera observations
-
-        Returns:
-            Batch dict with flattened observation.images
-        """
-        batch_flat = {k: v for k, v in batch.items()}
-
-        # Check if we have multi-camera observations
-        if "observation" in batch and isinstance(batch["observation"], dict):
-            obs = batch["observation"]
-            if "images" in obs and isinstance(obs["images"], dict):
-                # Multi-camera case: concatenate all camera views along channel dimension
-                camera_views = []
-                camera_names = sorted(obs["images"].keys())
-                
-                logger.debug(f"Flattening {len(camera_names)} camera views: {camera_names}")
-                
-                for camera_name in camera_names:
-                    camera_tensor = obs["images"][camera_name]
-                    camera_views.append(camera_tensor)
-
-                # Concatenate along channel dimension (last dim for images)
-                if len(camera_views) > 1:
-                    flattened_images = torch.cat(camera_views, dim=-1)  # Concat on channel dim
-                    logger.debug(f"Concatenated {len(camera_views)} cameras into shape {flattened_images.shape}")
-                else:
-                    flattened_images = camera_views[0]
-
-                # Create new observation dict with flattened images
-                obs_flat = {k: v for k, v in obs.items()}
-                obs_flat["images"] = flattened_images
-                batch_flat["observation"] = obs_flat
-            elif "images" in obs and isinstance(obs["images"], Tensor):
-                # Already single tensor, no flattening needed
-                logger.debug(f"Observations already in single tensor format: {obs['images'].shape}")
-                pass
-        
-        return batch_flat
 
     def _apply_inference_time_alignment(self, action: Tensor, reward_fn: Callable) -> Tensor:
         """
