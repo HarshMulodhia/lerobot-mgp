@@ -245,30 +245,40 @@ class MarkovGenerativePolicy(DiffusionPolicy):
                     filtered_batch[key] = value
 
             logger.info(f"Filtered batch keys: {list(filtered_batch.keys())}")
-            logger.info(f"Filtered batch structure: {[(k, v.shape) for k, v in filtered_batch.items()]}")
 
             if not filtered_batch:
                 raise ValueError("Filtered batch is empty - no observation tensors found")
 
-            # Add n_obs_steps dimension if missing (async_inference provides single timesteps)
-            # DiffusionPolicy expects (B, n_obs_steps, ...) but we get (B, ...)
-            # We look up the exact history requirements from the underlying diffusion module config
+            # 1. Expand the state observation dimension to match history requirements
             target_obs_steps = self.diffusion.config.n_obs_steps
+            if 'observation.state' in filtered_batch:
+                tensor = filtered_batch['observation.state']
+                if tensor.ndim == 2:  # (B, state_dim) -> (B, n_obs_steps, state_dim)
+                    filtered_batch['observation.state'] = tensor.unsqueeze(1).repeat(1, target_obs_steps, 1)
+                    logger.info(f"Expanded observation.state to {filtered_batch['observation.state'].shape}")
+
+            # 2. Extract, expand, and stack multiple camera features into a single 'observation.images' tensor
+            # Collect all keys starting with 'observation.images.' (e.g., .arm, .ext)
+            cam_keys = sorted([k for k in filtered_batch.keys() if k.startswith('observation.images.')])
             
-            for key in list(filtered_batch.keys()):
-                if key in ('observation.state', OBS_STATE):
-                    tensor = filtered_batch[key]
-                    if tensor.ndim == 2:  # Shape: (B, state_dim)
-                        expanded = tensor.unsqueeze(1)  # Shape: (B, 1, state_dim)
-                        filtered_batch[key] = expanded.repeat(1, target_obs_steps, 1)  # Shape: (B, 2, state_dim)
-                        logger.info(f"Expanded and repeated {key} from {tensor.shape} to {filtered_batch[key].shape}")
-                        
-                elif key.startswith('observation.images') or key == OBS_IMAGES:
-                    tensor = filtered_batch[key]
-                    if tensor.ndim == 4:  # Shape: (B, C, H, W)
-                        expanded = tensor.unsqueeze(1)  # Shape: (B, 1, C, H, W)
-                        filtered_batch[key] = expanded.repeat(1, target_obs_steps, 1, 1, 1)  # Shape: (B, 2, C, H, W)
-                        logger.info(f"Expanded and repeated {key} from {tensor.shape} to {filtered_batch[key].shape}")
+            if cam_keys:
+                expanded_cams = []
+                for k in cam_keys:
+                    tensor = filtered_batch[k]
+                    if tensor.ndim == 4:  # (B, C, H, W) -> (B, 1, C, H, W) -> (B, n_obs_steps, C, H, W)
+                        tensor = tensor.unsqueeze(1).repeat(1, target_obs_steps, 1, 1, 1)
+                    expanded_cams.append(tensor)
+                
+                # Stack all cameras along a new 'n_cameras' dimension
+                # Expected shape for LeRobot Diffusion: (B, n_obs_steps, n_cameras, C, H, W)
+                filtered_batch[OBS_IMAGES] = torch.stack(expanded_cams, dim=2)
+                logger.info(f"Stacked {len(cam_keys)} cameras into OBS_IMAGES with shape {filtered_batch[OBS_IMAGES].shape}")
+                
+                # Clean up individual camera keys so they don't pollute downstream generators
+                for k in cam_keys:
+                    del filtered_batch[k]
+
+            logger.info(f"Final batch keys passed to diffusion: {list(filtered_batch.keys())}")
 
             diff_actions = self.diffusion.generate_actions(filtered_batch)
             if diff_actions is None:
