@@ -256,7 +256,9 @@ class MarkovGenerativePolicy(DiffusionPolicy):
                 raise ValueError("Diffusion generate_actions returned None")
             logger.info(f"✓ Diffusion actions shape: {diff_actions.shape}")
         except Exception as e:
-            logger.error(f"✗ Diffusion component failed: {e}", exc_info=True)
+            import traceback
+            logger.error(f"✗ Diffusion component failed: {type(e).__name__}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise
 
         # Only attempt multicomponent superposition if explicitly enabled and other components exist
