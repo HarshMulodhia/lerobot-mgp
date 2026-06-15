@@ -200,23 +200,44 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         if not hasattr(self, 'config') or self.config is None:
             raise RuntimeError("self.config is not initialized")
 
+        # Diagnose batch structure
+        if batch is None:
+            raise RuntimeError("batch is None")
+
+        logger.info(f"Batch type: {type(batch)}, keys: {list(batch.keys()) if isinstance(batch, dict) else 'not a dict'}")
+
+        # Find first non-None value in batch
+        valid_tensor = None
+        for key, value in batch.items():
+            if value is not None:
+                logger.info(f"  Batch['{key}']: {type(value).__name__} = {value.shape if hasattr(value, 'shape') else value}")
+                if valid_tensor is None:
+                    valid_tensor = value
+            else:
+                logger.info(f"  Batch['{key}']: None")
+
+        if valid_tensor is None:
+            raise RuntimeError("All batch values are None")
+
         try:
-            batch_size = next(iter(batch.values())).shape[0]
-            device = next(iter(batch.values())).device
-        except (StopIteration, AttributeError) as e:
+            batch_size = valid_tensor.shape[0]
+            device = valid_tensor.device
+            logger.info(f"Extracted batch_size={batch_size}, device={device}")
+        except (AttributeError, IndexError) as e:
             logger.error(f"Failed to extract batch info: {e}")
             raise
 
         # Start with diffusion as primary generator (always available, most robust)
         try:
-            logger.debug(f"Calling diffusion.generate_actions with batch keys: {list(batch.keys())}")
+            logger.info(f"Calling diffusion.generate_actions with batch keys: {list(batch.keys())}")
+            logger.info(f"Batch structure: {[(k, v.shape if v is not None else None) for k, v in batch.items()]}")
             diff_actions = self.diffusion.generate_actions(batch)
             if diff_actions is None:
                 logger.error("Diffusion component returned None")
                 raise ValueError("Diffusion generate_actions returned None")
-            logger.info(f"Diffusion actions shape: {diff_actions.shape}")
+            logger.info(f"✓ Diffusion actions shape: {diff_actions.shape}")
         except Exception as e:
-            logger.error(f"Diffusion component failed: {e}", exc_info=True)
+            logger.error(f"✗ Diffusion component failed: {e}", exc_info=True)
             raise
 
         # Only attempt multicomponent superposition if explicitly enabled and other components exist
@@ -309,17 +330,25 @@ class MarkovGenerativePolicy(DiffusionPolicy):
             obs_features: Flattened observation features (B, obs_dim)
         """
         features = []
+        batch_size = None
+        device = None
 
         # Use state observations if available
-        if OBS_STATE in batch:
+        if OBS_STATE in batch and batch[OBS_STATE] is not None:
             state = batch[OBS_STATE]
+            batch_size = state.shape[0]
+            device = state.device
             if state.ndim == 3:  # (B, n_obs_steps, state_dim)
                 state = state.flatten(start_dim=1)  # (B, n_obs_steps * state_dim)
             features.append(state)
 
         # Use first image feature if available
-        if OBS_IMAGES in batch:
+        if OBS_IMAGES in batch and batch[OBS_IMAGES] is not None:
             images = batch[OBS_IMAGES]
+            if batch_size is None:
+                batch_size = images.shape[0]
+            if device is None:
+                device = images.device
             if images.ndim >= 4:  # (B, n_obs_steps, H, W, ...) or (B, H, W, ...)
                 images_flat = images.flatten(start_dim=1)
                 # Limit to first 512 dims to avoid huge gating network
@@ -330,8 +359,18 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         if features:
             obs_features = torch.cat(features, dim=-1)
         else:
-            # Fallback: use random features
-            obs_features = torch.randn(next(iter(batch.values())).shape[0], 512, device=next(iter(batch.values())).device)
+            # Fallback: create random features with correct shape
+            if batch_size is None or device is None:
+                # Last resort: find any tensor in batch
+                for v in batch.values():
+                    if v is not None:
+                        batch_size = v.shape[0]
+                        device = v.device
+                        break
+            if batch_size is None:
+                raise RuntimeError("Cannot determine batch_size or device from batch")
+            logger.warning("Using fallback random features for gating")
+            obs_features = torch.randn(batch_size, 512, device=device)
 
         return obs_features
 
