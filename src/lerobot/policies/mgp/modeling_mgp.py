@@ -252,17 +252,23 @@ class MarkovGenerativePolicy(DiffusionPolicy):
 
             # Add n_obs_steps dimension if missing (async_inference provides single timesteps)
             # DiffusionPolicy expects (B, n_obs_steps, ...) but we get (B, ...)
+            # We look up the exact history requirements from the underlying diffusion module config
+            target_obs_steps = self.diffusion.config.n_obs_steps
+            
             for key in list(filtered_batch.keys()):
                 if key in ('observation.state', OBS_STATE):
                     tensor = filtered_batch[key]
-                    if tensor.ndim == 2:  # (B, state_dim) -> (B, 1, state_dim)
-                        filtered_batch[key] = tensor.unsqueeze(1)
-                        logger.info(f"Expanded {key} from {tensor.shape} to {filtered_batch[key].shape}")
+                    if tensor.ndim == 2:  # Shape: (B, state_dim)
+                        expanded = tensor.unsqueeze(1)  # Shape: (B, 1, state_dim)
+                        filtered_batch[key] = expanded.repeat(1, target_obs_steps, 1)  # Shape: (B, 2, state_dim)
+                        logger.info(f"Expanded and repeated {key} from {tensor.shape} to {filtered_batch[key].shape}")
+                        
                 elif key.startswith('observation.images') or key == OBS_IMAGES:
                     tensor = filtered_batch[key]
-                    if tensor.ndim == 4:  # (B, C, H, W) -> (B, 1, C, H, W)
-                        filtered_batch[key] = tensor.unsqueeze(1)
-                        logger.info(f"Expanded {key} from {tensor.shape} to {filtered_batch[key].shape}")
+                    if tensor.ndim == 4:  # Shape: (B, C, H, W)
+                        expanded = tensor.unsqueeze(1)  # Shape: (B, 1, C, H, W)
+                        filtered_batch[key] = expanded.repeat(1, target_obs_steps, 1, 1, 1)  # Shape: (B, 2, C, H, W)
+                        logger.info(f"Expanded and repeated {key} from {tensor.shape} to {filtered_batch[key].shape}")
 
             diff_actions = self.diffusion.generate_actions(filtered_batch)
             if diff_actions is None:
