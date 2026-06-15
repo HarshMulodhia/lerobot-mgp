@@ -234,9 +234,23 @@ class MarkovGenerativePolicy(DiffusionPolicy):
 
         # Start with diffusion as primary generator (always available, most robust)
         try:
-            logger.info(f"Calling diffusion.generate_actions with batch keys: {list(batch.keys())}")
-            logger.info(f"Batch structure: {[(k, v.shape if v is not None else None) for k, v in batch.items()]}")
-            diff_actions = self.diffusion.generate_actions(batch)
+            # Filter batch to only include observation tensors (remove metadata like action, reward, etc.)
+            filtered_batch = {}
+            for key, value in batch.items():
+                # Keep only observation-related keys that are tensors
+                if key.startswith('observation.') and isinstance(value, Tensor):
+                    filtered_batch[key] = value
+                # Also handle OBS_STATE and OBS_IMAGES keys if they exist
+                elif key in (OBS_STATE, OBS_IMAGES) and isinstance(value, Tensor):
+                    filtered_batch[key] = value
+
+            logger.info(f"Filtered batch keys: {list(filtered_batch.keys())}")
+            logger.info(f"Filtered batch structure: {[(k, v.shape) for k, v in filtered_batch.items()]}")
+
+            if not filtered_batch:
+                raise ValueError("Filtered batch is empty - no observation tensors found")
+
+            diff_actions = self.diffusion.generate_actions(filtered_batch)
             if diff_actions is None:
                 logger.error("Diffusion component returned None")
                 raise ValueError("Diffusion generate_actions returned None")
@@ -329,7 +343,7 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         """Extract flattened observation features for superposition gating.
 
         Args:
-            batch: Observation batch
+            batch: Observation batch (may contain mixed types, will filter to tensors)
 
         Returns:
             obs_features: Flattened observation features (B, obs_dim)
@@ -339,27 +353,36 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         device = None
 
         # Use state observations if available
-        if OBS_STATE in batch and batch[OBS_STATE] is not None:
+        if OBS_STATE in batch and isinstance(batch[OBS_STATE], Tensor):
             state = batch[OBS_STATE]
             batch_size = state.shape[0]
             device = state.device
             if state.ndim == 3:  # (B, n_obs_steps, state_dim)
                 state = state.flatten(start_dim=1)  # (B, n_obs_steps * state_dim)
             features.append(state)
+        elif 'observation.state' in batch and isinstance(batch['observation.state'], Tensor):
+            state = batch['observation.state']
+            batch_size = state.shape[0]
+            device = state.device
+            if state.ndim == 3:
+                state = state.flatten(start_dim=1)
+            features.append(state)
 
-        # Use first image feature if available
-        if OBS_IMAGES in batch and batch[OBS_IMAGES] is not None:
-            images = batch[OBS_IMAGES]
-            if batch_size is None:
-                batch_size = images.shape[0]
-            if device is None:
-                device = images.device
-            if images.ndim >= 4:  # (B, n_obs_steps, H, W, ...) or (B, H, W, ...)
+        # Use image features if available
+        for key in batch.keys():
+            if key.startswith('observation.images') and isinstance(batch[key], Tensor):
+                images = batch[key]
+                if batch_size is None:
+                    batch_size = images.shape[0]
+                if device is None:
+                    device = images.device
+                # Flatten images
                 images_flat = images.flatten(start_dim=1)
                 # Limit to first 512 dims to avoid huge gating network
                 if images_flat.shape[1] > 512:
                     images_flat = images_flat[:, :512]
                 features.append(images_flat)
+                break  # Use only first image for gating
 
         if features:
             obs_features = torch.cat(features, dim=-1)
@@ -368,7 +391,7 @@ class MarkovGenerativePolicy(DiffusionPolicy):
             if batch_size is None or device is None:
                 # Last resort: find any tensor in batch
                 for v in batch.values():
-                    if v is not None:
+                    if isinstance(v, Tensor):
                         batch_size = v.shape[0]
                         device = v.device
                         break
