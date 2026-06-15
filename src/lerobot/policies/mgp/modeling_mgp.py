@@ -39,7 +39,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE, OBS_IMAGES
 
 from .configuration_mgp import MGPConfig
 from ._gm_utils import (
@@ -96,6 +96,7 @@ class MarkovGenerativePolicy(DiffusionPolicy):
             self.flow_generator = FlowMatchingGenerator(
                 action_dim=self._get_action_dim(),
                 hidden_dim=self.config.flow_hidden_dim,
+                horizon=self.config.n_action_steps,
             )
             logger.info("Flow (ODE) component initialized")
 
@@ -105,6 +106,7 @@ class MarkovGenerativePolicy(DiffusionPolicy):
                 action_dim=self._get_action_dim(),
                 num_modes=self.config.jump_num_modes,
                 jump_rate=self.config.jump_rate,
+                horizon=self.config.n_action_steps,
             )
             logger.info(f"Jump process component initialized ({self.config.jump_num_modes} modes)")
 
@@ -112,7 +114,9 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         if self.config.enable_ctmc_component:
             self.ctmc_generator = CTMCGenerator(
                 num_skills=self.config.ctmc_num_skills,
+                action_dim=self._get_action_dim(),
                 skill_dim=self.config.ctmc_skill_dim,
+                horizon=self.config.n_action_steps,
             )
             logger.info(f"CTMC component initialized ({self.config.ctmc_num_skills} skills)")
 
@@ -182,6 +186,138 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         if hasattr(self.config, "observation_feature") and hasattr(self.config.observation_feature, "shape"):
             return int(self.config.observation_feature.shape[0])
         return 512  # Default for image-based observations
+
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """Predict action chunk with markov superposition (Section 5.3, 5.1).
+
+        Implements L_t^VLA = w_diff(h_t) L_t^diff + w_ACT(h_t) L_t^ACT
+                            + w_flow(h_t) L_t^flow + w_CTMC(h_t) L_t^CTMC
+
+        Generates actions from each enabled component and blends with superposition weights.
+
+        Args:
+            batch: Observation batch with shape (B, n_obs_steps, ...)
+
+        Returns:
+            actions: Blended action chunk (B, n_action_steps, action_dim)
+        """
+        self.eval()
+        batch_size = next(iter(batch.values())).shape[0]
+        device = next(iter(batch.values())).device
+
+        # Collect actions from each enabled component
+        component_actions = []
+        component_names = []
+
+        # 1. Diffusion component (primary generator)
+        if self.config.enable_diffusion_component:
+            try:
+                diff_actions = self.diffusion.generate_actions(batch)
+                component_actions.append(diff_actions)
+                component_names.append("diffusion")
+            except Exception as e:
+                logger.warning(f"Diffusion component failed: {e}")
+
+        # 2. Flow component (deterministic ODE)
+        if self.config.enable_flow_component:
+            try:
+                flow_actions = self.flow_generator.generate_actions(batch_size, device)
+                component_actions.append(flow_actions)
+                component_names.append("flow")
+            except Exception as e:
+                logger.warning(f"Flow component failed: {e}")
+
+        # 3. Jump process component (mode switching)
+        if self.config.enable_jump_component:
+            try:
+                jump_actions = self.jump_generator.generate_actions(batch_size, device)
+                component_actions.append(jump_actions)
+                component_names.append("jump")
+            except Exception as e:
+                logger.warning(f"Jump component failed: {e}")
+
+        # 4. CTMC component (skill hierarchy)
+        if self.config.enable_ctmc_component:
+            try:
+                ctmc_actions = self.ctmc_generator.generate_actions(batch_size, device)
+                component_actions.append(ctmc_actions)
+                component_names.append("ctmc")
+            except Exception as e:
+                logger.warning(f"CTMC component failed: {e}")
+
+        # If no components generated successfully, fallback to diffusion
+        if not component_actions:
+            logger.warning("All components failed, falling back to diffusion model")
+            return self.diffusion.generate_actions(batch)
+
+        # If only one component, return it directly
+        if len(component_actions) == 1:
+            return component_actions[0]
+
+        # Compute superposition weights (Section 5.3)
+        if self.config.enable_markov_superposition and hasattr(self, "superposition_gate"):
+            try:
+                # Extract observation features for gating (flatten observation dims)
+                obs_features = self._extract_observation_features(batch)
+
+                # Compute weights: (B, num_components)
+                gate_weights = self.superposition_gate(obs_features)
+
+                logger.debug(f"Gate weights: {gate_weights.mean(dim=0).tolist()} for {component_names}")
+
+                # Blend actions: Σ w_i(h_t) * a_i
+                blended_actions = torch.zeros_like(component_actions[0])
+                for i, (actions, weight) in enumerate(zip(component_actions, gate_weights.T)):
+                    weight_expanded = weight.view(-1, 1, 1)  # (B, 1, 1) for broadcasting
+                    blended_actions = blended_actions + weight_expanded * actions
+
+                return blended_actions
+
+            except Exception as e:
+                logger.warning(f"Superposition gating failed: {e}, using simple averaging")
+
+        # Fallback: Simple averaging if superposition gating fails
+        logger.debug(f"Blending {len(component_actions)} components via simple averaging")
+        stacked_actions = torch.stack(component_actions, dim=0)  # (num_comp, B, H, action_dim)
+        return stacked_actions.mean(dim=0)  # (B, H, action_dim)
+
+    def _extract_observation_features(self, batch: dict[str, Tensor]) -> Tensor:
+        """Extract flattened observation features for superposition gating.
+
+        Args:
+            batch: Observation batch
+
+        Returns:
+            obs_features: Flattened observation features (B, obs_dim)
+        """
+        features = []
+
+        # Use state observations if available
+        if OBS_STATE in batch:
+            state = batch[OBS_STATE]
+            if state.ndim == 3:  # (B, n_obs_steps, state_dim)
+                state = state.flatten(start_dim=1)  # (B, n_obs_steps * state_dim)
+            features.append(state)
+
+        # Use first image feature if available
+        if OBS_IMAGES in batch:
+            images = batch[OBS_IMAGES]
+            if images.ndim >= 4:  # (B, n_obs_steps, H, W, ...) or (B, H, W, ...)
+                images_flat = images.flatten(start_dim=1)
+                # Limit to first 512 dims to avoid huge gating network
+                if images_flat.shape[1] > 512:
+                    images_flat = images_flat[:, :512]
+                features.append(images_flat)
+
+        if features:
+            obs_features = torch.cat(features, dim=-1)
+        else:
+            # Fallback: use random features
+            obs_features = torch.randn(next(iter(batch.values())).shape[0], 512, device=next(iter(batch.values())).device)
+
+        return obs_features
+
 
     def _init_reward_alignment(self):
         """Initialize reward alignment components (Section 6.2)."""

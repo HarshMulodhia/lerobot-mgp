@@ -177,23 +177,25 @@ class GeneratorMatchingLoss(nn.Module):
 
 class FlowMatchingGenerator(nn.Module):
     """Flow/ODE generator for deterministic behavior cloning (Section 3.3).
-    
+
     Learns velocity field v_θ(a_t, t) that generates action trajectories
     via ODE: da_t/dt = v_θ(a_t, t)
-    
+
     Loss: L^flow_t = ||v_θ(γ_t) - u_t||²
     """
 
-    def __init__(self, action_dim: int, hidden_dim: int = 128):
+    def __init__(self, action_dim: int, hidden_dim: int = 128, horizon: int = 16):
         """Initialize flow velocity network.
-        
+
         Args:
             action_dim: Dimensionality of action space
             hidden_dim: Hidden layer dimension
+            horizon: Action chunk length for trajectory generation
         """
         super().__init__()
         self.action_dim = action_dim
-        
+        self.horizon = horizon
+
         self.velocity_net = nn.Sequential(
             nn.Linear(action_dim + 1, hidden_dim),  # +1 for time t
             nn.ReLU(),
@@ -204,54 +206,81 @@ class FlowMatchingGenerator(nn.Module):
 
     def forward(self, a_t: Tensor, t: float = 0.5) -> Tensor:
         """Predict velocity v_θ(a_t, t).
-        
+
         Args:
             a_t: Action at current time (batch_size, action_dim)
             t: Time step in [0, 1]
-        
+
         Returns:
             velocity: Predicted velocity (batch_size, action_dim)
         """
         batch_size = a_t.shape[0]
         t_tensor = torch.full((batch_size, 1), t, device=a_t.device)
-        
+
         augmented = torch.cat([a_t, t_tensor], dim=-1)
         velocity = self.velocity_net(augmented)
-        
+
         return velocity
+
+    @torch.no_grad()
+    def generate_actions(self, batch_size: int, device: torch.device, dt: float = 1.0 / 16.0) -> Tensor:
+        """Generate action trajectory via ODE integration (Section 5.3).
+
+        Solves ODE: da_t/dt = v_θ(a_t, t) with Euler steps.
+
+        Args:
+            batch_size: Batch size
+            device: Torch device
+            dt: Time step for integration
+
+        Returns:
+            actions: Generated action chunk (batch_size, horizon, action_dim)
+        """
+        actions = []
+        a_t = torch.randn(batch_size, self.action_dim, device=device)
+
+        for i in range(self.horizon):
+            t = i / self.horizon
+            v_t = self.forward(a_t, t=t)
+            a_t = a_t + dt * v_t
+            actions.append(a_t.clone())
+
+        return torch.stack(actions, dim=1)
 
 
 class JumpProcessGenerator(nn.Module):
     """Jump Process generator for discrete mode switches (Section 3.3, Table 7).
-    
+
     Modeled as Poisson jump process with mode switching.
     Jump intensity λ_t and transition probabilities learned.
-    
+
     Loss: L^jump_t = KL[π_θ(·|h_t) || π_target]
     """
 
-    def __init__(self, action_dim: int, num_modes: int = 4, jump_rate: float = 0.1):
+    def __init__(self, action_dim: int, num_modes: int = 4, jump_rate: float = 0.1, horizon: int = 16):
         """Initialize jump process generator.
-        
+
         Args:
             action_dim: Dimensionality of action space
             num_modes: Number of discrete modes
             jump_rate: Poisson jump rate λ_t
+            horizon: Action chunk length
         """
         super().__init__()
         self.action_dim = action_dim
         self.num_modes = num_modes
         self.jump_rate = jump_rate
-        
+        self.horizon = horizon
+
         # Mode-specific action predictors
         self.mode_embeddings = nn.Embedding(num_modes, 64)
-        
+
         self.transition_net = nn.Sequential(
             nn.Linear(action_dim + 64, 128),
             nn.ReLU(),
             nn.Linear(128, num_modes),
         )
-        
+
         # Jump rate predictor
         self.rate_net = nn.Sequential(
             nn.Linear(action_dim, 64),
@@ -260,26 +289,36 @@ class JumpProcessGenerator(nn.Module):
             nn.Softplus(),
         )
 
+        # Mode-specific action generators
+        self.mode_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(action_dim + 64, 128),
+                nn.ReLU(),
+                nn.Linear(128, action_dim),
+            )
+            for _ in range(num_modes)
+        ])
+
     def forward(self, a_t: Tensor, t: float = 0.5) -> Tensor:
         """Predict mode transition probabilities.
-        
+
         Args:
             a_t: Action (batch_size, action_dim)
             t: Time step
-        
+
         Returns:
             logits: Mode logits (batch_size, num_modes)
         """
         batch_size = a_t.shape[0]
-        
+
         # Current mode embedding (sample for now)
         current_mode = torch.randint(0, self.num_modes, (batch_size,), device=a_t.device)
         mode_emb = self.mode_embeddings(current_mode)
-        
+
         # Transition logits
         augmented = torch.cat([a_t, mode_emb], dim=-1)
         logits = self.transition_net(augmented)
-        
+
         return logits
 
     def sample_jump_time(self, batch_size: int, device: torch.device) -> Tensor:
@@ -289,37 +328,82 @@ class JumpProcessGenerator(nn.Module):
         t_jump = -torch.log(u + 1e-8) / lambda_t
         return torch.clamp(t_jump, 0, 1)
 
+    @torch.no_grad()
+    def generate_actions(self, batch_size: int, device: torch.device) -> Tensor:
+        """Generate action trajectory with mode switches (Section 5.3).
+
+        Samples jump times and modes, then generates actions for each mode segment.
+
+        Args:
+            batch_size: Batch size
+            device: Torch device
+
+        Returns:
+            actions: Generated action chunk (batch_size, horizon, action_dim)
+        """
+        actions = []
+        current_modes = torch.randint(0, self.num_modes, (batch_size,), device=device)
+        a_t = torch.randn(batch_size, self.action_dim, device=device)
+
+        for step in range(self.horizon):
+            # Check for mode jumps
+            jump_probs = torch.full((batch_size,), self.jump_rate / self.horizon, device=device)
+            jump_mask = torch.rand(batch_size, device=device) < jump_probs
+
+            # Sample new modes for jumps
+            new_modes = torch.randint(0, self.num_modes, (batch_size,), device=device)
+            current_modes = torch.where(jump_mask, new_modes, current_modes)
+
+            # Get mode embeddings
+            mode_emb = self.mode_embeddings(current_modes)
+
+            # Generate mode-specific actions
+            augmented = torch.cat([a_t, mode_emb], dim=-1)
+            mode_action = torch.stack([
+                self.mode_nets[current_modes[i]](augmented[i:i+1])
+                for i in range(batch_size)
+            ], dim=0).squeeze(1)
+
+            a_t = a_t + mode_action / self.horizon
+            actions.append(a_t.clone())
+
+        return torch.stack(actions, dim=1)
+
 
 class CTMCGenerator(nn.Module):
     """CTMC (Continuous-Time Markov Chain) generator for discrete skills (Section 3.3, Table 7).
-    
+
     High-level skill/mode switching via rate matrix Q.
     Models skill transitions as continuous-time Markov process.
-    
+
     Loss: L^CTMC_t = cross_entropy[s_t^pred, s_t^target]
     """
 
-    def __init__(self, num_skills: int, skill_dim: int = 64):
+    def __init__(self, num_skills: int, action_dim: int = 6, skill_dim: int = 64, horizon: int = 16):
         """Initialize CTMC generator.
-        
+
         Args:
             num_skills: Number of discrete skills/modes
+            action_dim: Dimensionality of action space
             skill_dim: Skill embedding dimension
+            horizon: Action chunk length
         """
         super().__init__()
         self.num_skills = num_skills
+        self.action_dim = action_dim
         self.skill_dim = skill_dim
-        
+        self.horizon = horizon
+
         # Skill embeddings
         self.skill_embeddings = nn.Embedding(num_skills, skill_dim)
-        
+
         # Rate matrix Q (transition rates)
         self.rate_matrix_net = nn.Sequential(
             nn.Linear(skill_dim, 128),
             nn.ReLU(),
             nn.Linear(128, num_skills),
         )
-        
+
         # Transition probability predictor
         self.transition_net = nn.Sequential(
             nn.Linear(skill_dim + 1, 128),  # +1 for time
@@ -327,32 +411,42 @@ class CTMCGenerator(nn.Module):
             nn.Linear(128, num_skills),
         )
 
+        # Skill-specific action generators
+        self.skill_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(skill_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, action_dim),
+            )
+            for _ in range(num_skills)
+        ])
+
     def forward(self, current_skill: Tensor, t: float = 0.5) -> Tensor:
         """Predict next skill logits.
-        
+
         Args:
             current_skill: Current skill index (batch_size,)
             t: Time step in [0, 1]
-        
+
         Returns:
             logits: Next skill logits (batch_size, num_skills)
         """
         batch_size = current_skill.shape[0]
         device = current_skill.device
-        
+
         # Get skill embedding
         skill_emb = self.skill_embeddings(current_skill)
-        
+
         # Rate matrix
         Q = self.rate_matrix_net(skill_emb)
-        
+
         # Time augmented
         t_tensor = torch.full((batch_size, 1), t, device=device)
         augmented = torch.cat([skill_emb, t_tensor], dim=-1)
-        
+
         # Transition logits
         logits = self.transition_net(augmented)
-        
+
         return logits
 
     def matrix_exponential(self, Q: Tensor, t: float) -> Tensor:
@@ -361,6 +455,42 @@ class CTMCGenerator(nn.Module):
         I = torch.eye(Q.shape[-1], device=Q.device)
         P_t = I + t * Q / (torch.norm(Q, dim=-1, keepdim=True) + 1e-8)
         return P_t
+
+    @torch.no_grad()
+    def generate_actions(self, batch_size: int, device: torch.device) -> Tensor:
+        """Generate action trajectory via skill switching (Section 5.3).
+
+        Samples skill transitions and generates mode-specific actions.
+
+        Args:
+            batch_size: Batch size
+            device: Torch device
+
+        Returns:
+            actions: Generated action chunk (batch_size, horizon, action_dim)
+        """
+        actions = []
+        current_skills = torch.randint(0, self.num_skills, (batch_size,), device=device)
+
+        for step in range(self.horizon):
+            # Get skill embeddings
+            skill_emb = self.skill_embeddings(current_skills)
+
+            # Generate skill-specific actions
+            skill_actions = torch.stack([
+                self.skill_nets[current_skills[i]](skill_emb[i:i+1])
+                for i in range(batch_size)
+            ], dim=0).squeeze(1)
+
+            actions.append(skill_actions)
+
+            # Sample next skill (simplified: stay in skill with prob 0.9)
+            stay_prob = 0.9
+            transition_mask = torch.rand(batch_size, device=device) > stay_prob
+            new_skills = torch.randint(0, self.num_skills, (batch_size,), device=device)
+            current_skills = torch.where(transition_mask, new_skills, current_skills)
+
+        return torch.stack(actions, dim=1)
 
 
 class SafetyConstrainedSampler(nn.Module):
