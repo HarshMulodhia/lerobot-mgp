@@ -278,13 +278,23 @@ class MarkovGenerativePolicy(DiffusionPolicy):
                 for k in cam_keys:
                     del filtered_batch[k]
 
-            logger.info(f"Final batch keys passed to diffusion: {list(filtered_batch.keys())}")
+            # Force the underlying diffusion policy to use 15 inference steps instead of the 100 default fallback
+            self.diffusion.config.num_inference_steps = 15
+            
+            logger.info(f"Final batch keys passed to diffusion backend: {list(filtered_batch.keys())}")
 
-            diff_actions = self.diffusion.generate_actions(filtered_batch)
+            # Force FP16 mixed precision execution context for massive GPU acceleration
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                diff_actions = self.diffusion.generate_actions(filtered_batch)
+                
             if diff_actions is None:
                 logger.error("Diffusion component returned None")
                 raise ValueError("Diffusion generate_actions returned None")
+                
+            # Cast actions safely back to Float32 to match standard hardware driver expectations
+            diff_actions = diff_actions.to(torch.float32)
             logger.info(f"✓ Diffusion actions shape: {diff_actions.shape}")
+            
         except Exception as e:
             import traceback
             logger.error(f"✗ Diffusion component failed: {type(e).__name__}: {e}")
