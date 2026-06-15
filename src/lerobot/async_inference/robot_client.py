@@ -32,7 +32,7 @@ python src/lerobot/async_inference/robot_client.py \
     --debug_visualize_queue_size=True
 ```
 """
-
+import io
 import logging
 import pickle  # nosec
 import threading
@@ -282,8 +282,19 @@ class RobotClient:
                 receive_time = time.time()
 
                 # Deserialize bytes back into list[TimedAction]
+                
+ 
                 deserialize_start = time.perf_counter()
-                timed_actions = pickle.loads(actions_chunk.data)  # nosec
+                class _CPUUnpickler(pickle.Unpickler):
+                    def find_class(self, module, name):
+                        if module == "torch.storage" and name == "_load_from_bytes":
+                            return lambda b: torch.load(
+                                io.BytesIO(b), map_location="cpu", weights_only=False
+                            )
+                        return super().find_class(module, name)
+ 
+                timed_actions = _CPUUnpickler(io.BytesIO(actions_chunk.data)).load()
+                # timed_actions = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
 
                 # Log device type of received actions
