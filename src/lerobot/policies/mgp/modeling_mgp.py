@@ -191,40 +191,51 @@ class MarkovGenerativePolicy(DiffusionPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict action chunk with markov superposition (Section 5.3, 5.1).
 
-        Implements L_t^VLA = w_diff(h_t) L_t^diff + w_ACT(h_t) L_t^ACT
-                            + w_flow(h_t) L_t^flow + w_CTMC(h_t) L_t^CTMC
-
-        Generates actions from each enabled component and blends with superposition weights.
-
-        Args:
-            batch: Observation batch with shape (B, n_obs_steps, ...)
-
-        Returns:
-            actions: Blended action chunk (B, n_action_steps, action_dim)
+        For now: Use diffusion as primary, with other components as opt-in via gating.
         """
         self.eval()
-        batch_size = next(iter(batch.values())).shape[0]
-        device = next(iter(batch.values())).device
 
-        # Collect actions from each enabled component
-        component_actions = []
-        component_names = []
+        try:
+            batch_size = next(iter(batch.values())).shape[0]
+            device = next(iter(batch.values())).device
+        except (StopIteration, AttributeError) as e:
+            logger.error(f"Failed to extract batch info: {e}")
+            raise
 
-        # 1. Diffusion component (primary generator)
-        if self.config.enable_diffusion_component:
-            try:
-                diff_actions = self.diffusion.generate_actions(batch)
-                component_actions.append(diff_actions)
-                component_names.append("diffusion")
-            except Exception as e:
-                logger.warning(f"Diffusion component failed: {e}")
+        # Start with diffusion as primary generator (always available, most robust)
+        try:
+            diff_actions = self.diffusion.generate_actions(batch)
+            if diff_actions is None:
+                logger.error("Diffusion component returned None")
+                raise ValueError("Diffusion generate_actions returned None")
+            logger.debug(f"Diffusion actions shape: {diff_actions.shape}")
+        except Exception as e:
+            logger.error(f"Diffusion component failed: {e}", exc_info=True)
+            raise
+
+        # Only attempt multicomponent superposition if explicitly enabled and other components exist
+        if not (self.config.enable_markov_superposition and
+                (self.config.enable_flow_component or
+                 self.config.enable_jump_component or
+                 self.config.enable_ctmc_component)):
+            # Single component (diffusion only)
+            return diff_actions
+
+        # Multi-component case: collect from other generators
+        component_actions = [diff_actions]
+        component_names = ["diffusion"]
+        n_action_steps_expected = diff_actions.shape[1]
 
         # 2. Flow component (deterministic ODE)
         if self.config.enable_flow_component:
             try:
                 flow_actions = self.flow_generator.generate_actions(batch_size, device)
-                component_actions.append(flow_actions)
-                component_names.append("flow")
+                if flow_actions is not None and flow_actions.shape[1] == n_action_steps_expected:
+                    component_actions.append(flow_actions)
+                    component_names.append("flow")
+                    logger.debug(f"Flow actions shape: {flow_actions.shape}")
+                else:
+                    logger.warning(f"Flow component shape mismatch: got {flow_actions.shape if flow_actions is not None else None}, expected (..., {n_action_steps_expected}, ...)")
             except Exception as e:
                 logger.warning(f"Flow component failed: {e}")
 
@@ -232,8 +243,12 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         if self.config.enable_jump_component:
             try:
                 jump_actions = self.jump_generator.generate_actions(batch_size, device)
-                component_actions.append(jump_actions)
-                component_names.append("jump")
+                if jump_actions is not None and jump_actions.shape[1] == n_action_steps_expected:
+                    component_actions.append(jump_actions)
+                    component_names.append("jump")
+                    logger.debug(f"Jump actions shape: {jump_actions.shape}")
+                else:
+                    logger.warning(f"Jump component shape mismatch: got {jump_actions.shape if jump_actions is not None else None}, expected (..., {n_action_steps_expected}, ...)")
             except Exception as e:
                 logger.warning(f"Jump component failed: {e}")
 
@@ -241,34 +256,33 @@ class MarkovGenerativePolicy(DiffusionPolicy):
         if self.config.enable_ctmc_component:
             try:
                 ctmc_actions = self.ctmc_generator.generate_actions(batch_size, device)
-                component_actions.append(ctmc_actions)
-                component_names.append("ctmc")
+                if ctmc_actions is not None and ctmc_actions.shape[1] == n_action_steps_expected:
+                    component_actions.append(ctmc_actions)
+                    component_names.append("ctmc")
+                    logger.debug(f"CTMC actions shape: {ctmc_actions.shape}")
+                else:
+                    logger.warning(f"CTMC component shape mismatch: got {ctmc_actions.shape if ctmc_actions is not None else None}, expected (..., {n_action_steps_expected}, ...)")
             except Exception as e:
                 logger.warning(f"CTMC component failed: {e}")
 
-        # If no components generated successfully, fallback to diffusion
-        if not component_actions:
-            logger.warning("All components failed, falling back to diffusion model")
-            return self.diffusion.generate_actions(batch)
-
-        # If only one component, return it directly
+        # If only diffusion succeeded, return it
         if len(component_actions) == 1:
-            return component_actions[0]
+            logger.debug("Using diffusion only (other components failed)")
+            return diff_actions
 
         # Compute superposition weights (Section 5.3)
-        if self.config.enable_markov_superposition and hasattr(self, "superposition_gate"):
+        if hasattr(self, "superposition_gate"):
             try:
-                # Extract observation features for gating (flatten observation dims)
+                # Extract observation features for gating
                 obs_features = self._extract_observation_features(batch)
 
                 # Compute weights: (B, num_components)
                 gate_weights = self.superposition_gate(obs_features)
-
                 logger.debug(f"Gate weights: {gate_weights.mean(dim=0).tolist()} for {component_names}")
 
                 # Blend actions: Σ w_i(h_t) * a_i
                 blended_actions = torch.zeros_like(component_actions[0])
-                for i, (actions, weight) in enumerate(zip(component_actions, gate_weights.T)):
+                for actions, weight in zip(component_actions, gate_weights.T):
                     weight_expanded = weight.view(-1, 1, 1)  # (B, 1, 1) for broadcasting
                     blended_actions = blended_actions + weight_expanded * actions
 
@@ -276,11 +290,11 @@ class MarkovGenerativePolicy(DiffusionPolicy):
 
             except Exception as e:
                 logger.warning(f"Superposition gating failed: {e}, using simple averaging")
-
-        # Fallback: Simple averaging if superposition gating fails
-        logger.debug(f"Blending {len(component_actions)} components via simple averaging")
-        stacked_actions = torch.stack(component_actions, dim=0)  # (num_comp, B, H, action_dim)
-        return stacked_actions.mean(dim=0)  # (B, H, action_dim)
+                return torch.stack(component_actions, dim=0).mean(dim=0)
+        else:
+            # No gating network, use simple averaging
+            logger.debug(f"No superposition gate, blending {len(component_actions)} components via averaging")
+            return torch.stack(component_actions, dim=0).mean(dim=0)
 
     def _extract_observation_features(self, batch: dict[str, Tensor]) -> Tensor:
         """Extract flattened observation features for superposition gating.
