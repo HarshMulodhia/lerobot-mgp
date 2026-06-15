@@ -206,25 +206,30 @@ class MarkovGenerativePolicy(DiffusionPolicy):
 
         logger.info(f"Batch type: {type(batch)}, keys: {list(batch.keys()) if isinstance(batch, dict) else 'not a dict'}")
 
-        # Find first non-None value in batch
+        # Find first non-None TENSOR value in batch (skip scalars, dicts, lists, etc.)
         valid_tensor = None
         for key, value in batch.items():
             if value is not None:
-                logger.info(f"  Batch['{key}']: {type(value).__name__} = {value.shape if hasattr(value, 'shape') else value}")
-                if valid_tensor is None:
+                if isinstance(value, Tensor) and hasattr(value, 'shape'):
+                    logger.info(f"  Batch['{key}']: Tensor = {value.shape}")
                     valid_tensor = value
+                    break
+                else:
+                    type_name = type(value).__name__
+                    val_repr = f"{type(value).__name__} = {value if not isinstance(value, (dict, list)) else type(value).__name__}"
+                    logger.info(f"  Batch['{key}']: {val_repr}")
             else:
                 logger.info(f"  Batch['{key}']: None")
 
         if valid_tensor is None:
-            raise RuntimeError("All batch values are None")
+            raise RuntimeError("No valid tensor found in batch")
 
         try:
             batch_size = valid_tensor.shape[0]
             device = valid_tensor.device
             logger.info(f"Extracted batch_size={batch_size}, device={device}")
         except (AttributeError, IndexError) as e:
-            logger.error(f"Failed to extract batch info: {e}")
+            logger.error(f"Failed to extract batch info from tensor: {e}")
             raise
 
         # Start with diffusion as primary generator (always available, most robust)
