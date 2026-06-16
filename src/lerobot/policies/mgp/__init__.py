@@ -29,7 +29,7 @@ Reference: "Markov Generative Policies for SO-101 with LeRobot" (2026)
 """
 
 from .configuration_mgp import MGPConfig
-from .modeling_mgp import MarkovGenerativePolicy, MGPPolicy
+from .modeling_mgp import MarkovGenerativePolicy, MGPPolicy, MGPRgbEncoder, MGPDiffusionHead
 from ._gm_utils import (
     GaussianCondOTPath,
     GeneratorMatchingLoss,
@@ -37,20 +37,18 @@ from ._gm_utils import (
     JumpProcessGenerator,
     CTMCGenerator,
     SafetyConstrainedSampler,
-    MarkovSuperpositionGate,
-    ProbabilityPathDensity,
 )
 
 __all__ = [
     "MGPConfig",
     "MarkovGenerativePolicy",
     "MGPPolicy",
+    "MGPRgbEncoder",
+    "MGPDiffusionHead",
     "GaussianCondOTPath",
     "GeneratorMatchingLoss",
     "FlowMatchingGenerator",
     "JumpProcessGenerator",
     "CTMCGenerator",
     "SafetyConstrainedSampler",
-    "MarkovSuperpositionGate",
-    "ProbabilityPathDensity",
 ]
